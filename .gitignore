@@ -1,0 +1,11 @@
+# secrets
+coin.cfg
+.env
+*.env
+
+# generated
+__pycache__/
+*.pyc
+*.log
+coin_backtest_output/
+out/
