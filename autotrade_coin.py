@@ -214,6 +214,9 @@ class Bot:
             self.store.mark_pending_exit(min(pos.qty, remain))
             log(f"  ⚠ Sell partially filled (Remaining quantity {remain:.8f}). "
                 f"The remaining position will be closed regardless of the next signal.")
+            self.alert(f"⚠️ Sell partially filled\n{self.cfg.market}\n"
+                       f"Sold quantity {exec_qty or 0:.8f} / Remaining quantity {remain:.8f}\n"
+                       f"Retrying the remainder in one minute.")
         log_order({"timestamp": fmt(now_kst()), "side": "sell", "reason": reason, "market": self.cfg.market,
                    "quantity": f"{exec_qty or qty:.8f}", "fill_price": f"{avg:.0f}" if avg else "",
                    "amount": f"{(exec_qty or qty) * (avg or price or 0):.0f}", "mode": "live",
