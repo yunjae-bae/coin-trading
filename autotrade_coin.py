@@ -1,262 +1,503 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import base64
 import csv
-import hashlib
-import hmac
-import json
 import os
+import sys
 import time
-import uuid
+import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
-import requests
 
-from coin_kernel import FEE_RATE, MARKET, MIN_ORDER_KRW, WARMUP_HOURS, decide_last_bar
+import notify
+from bot_state import KST, StateStore, StopFlag, fmt, now_kst
+from coin_config import BASE_DIR, ENV_PATH, Config, ConfigError, describe, load_config
+from coin_kernel import (REASON_STOP, compute_signals, decide_last_bar, resample_ohlcv,
+                         stop_loss_hit, warmup_bars)
+from upbit_api import Upbit, UpbitError
 
-BASE_URL = "https://api.upbit.com"
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 OUT_DIR = os.path.join(BASE_DIR, "out")
+LOG_PATH = os.path.join(OUT_DIR, "\uae30\ub85d.log")
+ORDERS_PATH = os.path.join(OUT_DIR, "\uc8fc\ubb38\ub0b4\uc5ed.csv")
+STATUS_PATH = os.path.join(OUT_DIR, "status.txt")
+STATE_PATH = os.path.join(OUT_DIR, "state.json")
+STOP_PATH = os.path.join(OUT_DIR, "\ubd07\uc815\uc9c0.txt")
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
-_env_file = os.getenv("ENV_FILE", "")
-if load_dotenv is not None:
-    for fp in [_env_file, "coin.cfg", ".env"]:
-        if fp and os.path.exists(fp):
-            load_dotenv(fp, override=True)
-            print(f"[CONFIG] loaded {fp}")
-            break
-
-ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY", "").strip()
-SECRET_KEY = os.getenv("UPBIT_SECRET_KEY", "").strip()
-DRY_RUN = (os.getenv("DRY_RUN", "1").strip() != "0")
-FETCH_COUNT = 60
-
-ORDERS_HEADER = ["ts", "action", "market", "ord_type", "krw_amount", "volume", "price_ref",
-                 "uuid", "state", "dry_run", "detail"]
+ORDER_HEADER = ["timestamp", "side", "reason", "market", "quantity", "fill_price", "amount", "mode", "order_id"]
+LOG_MAX_BYTES = 5 * 1024 * 1024
 
 
-def _log(line: str) -> None:
+def _rotate_log() -> None:
+    try:
+        if os.path.getsize(LOG_PATH) < LOG_MAX_BYTES:
+            return
+        os.replace(LOG_PATH, LOG_PATH + ".1")
+    except OSError:
+        pass
+
+
+def log(msg: str) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
-    stamp = datetime.now(timezone.utc).isoformat()
-    with open(os.path.join(OUT_DIR, "run.log"), "a", encoding="utf-8", newline="\n") as f:
-        f.write(f"{stamp} {line}\n")
-    print(f"{stamp} {line}")
+    line = f"[{fmt(now_kst())}] {msg}"
+    print(line, flush=True)
+    try:
+        _rotate_log()
+        with open(LOG_PATH, "a", encoding="utf-8", newline="\n") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
-def _log_order(row: Dict[str, Any]) -> None:
+def log_order(row: dict) -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
-    p = os.path.join(OUT_DIR, "orders.csv")
-    new = not (os.path.exists(p) and os.path.getsize(p) > 0)
-    with open(p, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=ORDERS_HEADER)
+    new = not (os.path.exists(ORDERS_PATH) and os.path.getsize(ORDERS_PATH) > 0)
+    with open(ORDERS_PATH, "a", newline="", encoding="utf-8-sig") as f:   # UTF-8 BOM for spreadsheet compatibility.
+        w = csv.DictWriter(f, fieldnames=ORDER_HEADER)
         if new:
             w.writeheader()
-        w.writerow({k: row.get(k, "") for k in ORDERS_HEADER})
+        w.writerow({k: row.get(k, "") for k in ORDER_HEADER})
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+class Bot:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.api = Upbit(cfg.access_key, cfg.secret_key)
+        self.store = StateStore(STATE_PATH)
+        self.stop = StopFlag(STOP_PATH)
+        self.last_error = ""
+        self.last_decision = "-"
+        self.fail_streak = 0
+        self.next_wake: Optional[datetime] = None
 
-
-def _jwt(params: Optional[Dict[str, Any]] = None) -> str:
-    payload: Dict[str, Any] = {"access_key": ACCESS_KEY, "nonce": str(uuid.uuid4())}
-    if params:
-        qs = "&".join(f"{k}={v}" for k, v in params.items())
-        payload["query_hash"] = hashlib.sha512(qs.encode()).hexdigest()
-        payload["query_hash_alg"] = "SHA512"
-    header = _b64url(json.dumps({"alg": "HS512", "typ": "JWT"}, separators=(",", ":")).encode())
-    body = _b64url(json.dumps(payload, separators=(",", ":")).encode())
-    sig = _b64url(hmac.new(SECRET_KEY.encode(), f"{header}.{body}".encode(), hashlib.sha512).digest())
-    return f"{header}.{body}.{sig}"
-
-
-def _private(method: str, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    headers = {"Authorization": f"Bearer {_jwt(params)}"}
-    url = BASE_URL + path
-    if method == "GET":
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-    else:
-        headers["Content-Type"] = "application/json; charset=utf-8"
-        r = requests.post(url, json=params, headers=headers, timeout=10)
-    if r.status_code >= 400:
-        raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
-    return r.json()
-
-
-def fetch_1h_closed(count: int = FETCH_COUNT) -> pd.DataFrame:
-    r = requests.get(f"{BASE_URL}/v1/candles/minutes/60",
-                     params={"market": MARKET, "count": count}, timeout=10)
-    r.raise_for_status()
-    df = pd.DataFrame(r.json())
-    df["ts"] = pd.to_datetime(df["candle_date_time_utc"], errors="coerce").dt.tz_localize(timezone.utc)
-    df = df.rename(columns={"opening_price": "open", "high_price": "high", "low_price": "low",
-                            "trade_price": "close", "candle_acc_trade_volume": "volume"})
-    df = df.dropna(subset=["ts"]).set_index("ts").sort_index()
-    now = pd.Timestamp(datetime.now(timezone.utc))
-    df = df[df.index + pd.Timedelta(hours=1) <= now]
-    return df[["open", "high", "low", "close", "volume"]].astype(float)
-
-
-def fetch_last_price() -> Optional[float]:
-    try:
-        r = requests.get(f"{BASE_URL}/v1/ticker", params={"markets": MARKET}, timeout=10)
-        r.raise_for_status()
-        return float(r.json()[0]["trade_price"])
-    except (requests.RequestException, ValueError, KeyError, IndexError):
-        return None
-
-
-def fetch_balances() -> Tuple[float, float]:
-    rows: List[Dict[str, Any]] = _private("GET", "/v1/accounts")
-    krw = btc = 0.0
-    for r in rows:
-        if r.get("currency") == "KRW":
-            krw = float(r.get("balance") or 0.0)
-        elif r.get("currency") == "BTC" and str(r.get("unit_currency")) == "KRW":
-            btc = float(r.get("balance") or 0.0)
-    return krw, btc
-
-
-def is_long(btc: float, last_price: Optional[float]) -> bool:
-    if btc <= 0:
-        return False
-    px = last_price or 0.0
-    return btc * px >= MIN_ORDER_KRW
-
-
-def _wait_done(order_uuid: str, timeout_sec: float = 30.0) -> str:
-    deadline = time.monotonic() + timeout_sec
-    state = "unknown"
-    while time.monotonic() < deadline:
+    def alert(self, text: str) -> None:
         try:
-            j = _private("GET", "/v1/order", {"uuid": order_uuid})
-            state = str(j.get("state") or "")
-            if state in ("done", "cancel"):
-                return state
-        except RuntimeError as e:
-            _log(f"[WARN] order poll failed: {e}")
-        time.sleep(1.5)
-    return state
+            tag = "" if not self.cfg.dry_run else "[dry run] "
+            notify.send(self.cfg, tag + text)
+        except Exception as e:
+            log(f"  (Notification delivery failed: {type(e).__name__})")
 
 
-def market_buy_all(krw: float, price_ref: Optional[float]) -> None:
-    order_krw = math_floor_krw(krw / (1.0 + FEE_RATE))
-    if order_krw < MIN_ORDER_KRW:
-        _log(f"[SKIP] BUY: available KRW {order_krw:,.0f} < minimum {MIN_ORDER_KRW:,.0f}")
-        return
-    params = {"market": MARKET, "side": "bid", "ord_type": "price",
-              "price": str(order_krw), "identifier": f"coinbot-{uuid.uuid4().hex}"}
-    if DRY_RUN:
-        _log(f"[DRY_RUN] BUY {MARKET} {order_krw:,.0f} KRW @~{price_ref}")
-        _log_order({"ts": datetime.now(timezone.utc).isoformat(), "action": "BUY", "market": MARKET,
-                    "ord_type": "price", "krw_amount": order_krw, "price_ref": price_ref,
-                    "dry_run": 1, "state": "DRY_RUN"})
-        return
-    j = _private("POST", "/v1/orders", params)
-    state = _wait_done(str(j.get("uuid")))
-    _log(f"[ORDER] BUY {order_krw:,.0f} KRW uuid={j.get('uuid')} state={state}")
-    _log_order({"ts": datetime.now(timezone.utc).isoformat(), "action": "BUY", "market": MARKET,
-                "ord_type": "price", "krw_amount": order_krw, "price_ref": price_ref,
-                "uuid": j.get("uuid"), "state": state, "dry_run": 0})
+    def fetch_bars(self) -> pd.DataFrame:
+        need_1h = (warmup_bars(self.cfg) + 5) * self.cfg.bar_hours
+        df_1h = self.api.candles_1h(self.cfg.market, need_1h)
+        bars = resample_ohlcv(df_1h, self.cfg.timeframe)
+        if len(bars) < warmup_bars(self.cfg):
+            raise UpbitError(
+                f"Insufficient historical bars for a decision ({len(bars)} / {warmup_bars(self.cfg)} required)",
+                "Retrying shortly.")
+        return bars
+
+    def read_account(self, price: Optional[float]) -> Tuple[float, float]:
+        if self.cfg.dry_run and not (self.cfg.access_key and self.cfg.secret_key):
+            pos = self.store.state.position
+            return 10_000_000.0, pos.qty
+        return self.api.balances(self.cfg.market)
 
 
-def market_sell_all(btc: float, price_ref: Optional[float]) -> None:
-    volume = math_floor8(btc)
-    if volume <= 0 or (price_ref or 0.0) * volume < MIN_ORDER_KRW:
-        _log(f"[SKIP] SELL: quantity {volume} below the minimum order value")
-        return
-    params = {"market": MARKET, "side": "ask", "ord_type": "market",
-              "volume": f"{volume:.8f}", "identifier": f"coinbot-{uuid.uuid4().hex}"}
-    if DRY_RUN:
-        _log(f"[DRY_RUN] SELL {MARKET} {volume:.8f} BTC @~{price_ref}")
-        _log_order({"ts": datetime.now(timezone.utc).isoformat(), "action": "SELL", "market": MARKET,
-                    "ord_type": "market", "volume": f"{volume:.8f}", "price_ref": price_ref,
-                    "dry_run": 1, "state": "DRY_RUN"})
-        return
-    j = _private("POST", "/v1/orders", params)
-    state = _wait_done(str(j.get("uuid")))
-    _log(f"[ORDER] SELL {volume:.8f} BTC uuid={j.get('uuid')} state={state}")
-    _log_order({"ts": datetime.now(timezone.utc).isoformat(), "action": "SELL", "market": MARKET,
-                "ord_type": "market", "volume": f"{volume:.8f}", "price_ref": price_ref,
-                "uuid": j.get("uuid"), "state": state, "dry_run": 0})
+    def _identifier(self, bar_iso: str, side: str) -> str:
+        return f"qqe-{bar_iso.replace('-', '').replace(':', '')[:13]}-{side}"
+
+    def buy(self, krw: float, price: Optional[float], bar_iso: str, reason: str,
+            bar_close: float = 0.0) -> None:
+        budget = krw * self.cfg.position_pct / 100.0
+        if self.cfg.max_order_krw > 0:
+            budget = min(budget, self.cfg.max_order_krw)
+        order_krw = float(int(budget / (1.0 + self.cfg.fee_rate)))
+        if order_krw < self.cfg.min_order_krw:
+            log(f"  Skipping buy: available order amount {order_krw:,.0f} KRW is below the minimum order amount "
+                f"{self.cfg.min_order_krw:,.0f} KRW")
+            return
+        # Do not guard sells: delaying a risk-reducing exit can be more dangerous.
+        if price and bar_close and self.cfg.price_guard_pct > 0:
+            gap = (price / bar_close - 1.0) * 100.0
+            if abs(gap) > self.cfg.price_guard_pct:
+                log(f"  Buy deferred: signal price ({bar_close:,.0f} KRW), current price differs by {gap:+.2f}% "
+                    f"(allowed {self.cfg.price_guard_pct:g}%)")
+                return
+        ident = self._identifier(bar_iso, "bid")
+        if self.cfg.dry_run:
+            log(f"  [dry run] buy {order_krw:,.0f} KRW (approximate price {price:,.0f} KRW)" if price
+                else f"  [dry run] buy {order_krw:,.0f} KRW")
+            qty = order_krw / price if price else 0.0
+            self.store.open_position(qty, price or 0.0)
+            self.alert(f"🟢 buy\n{self.cfg.market} {order_krw:,.0f} KRW\n"
+                       f"Price {price:,.0f} KRW\nReason: {reason}" if price else
+                       f"🟢 buy\n{self.cfg.market} {order_krw:,.0f} KRW\nReason: {reason}")
+            log_order({"timestamp": fmt(now_kst()), "side": "buy", "reason": reason,
+                       "market": self.cfg.market, "quantity": f"{qty:.8f}", "fill_price": price or "",
+                       "amount": f"{order_krw:.0f}", "mode": "dry run", "order_id": ident})
+            return
+
+        qty_before = self.api.balances(self.cfg.market)[1]
+        res = self.api.order({"market": self.cfg.market, "side": "bid", "ord_type": "price",
+                              "price": str(order_krw), "identifier": ident})
+        state, exec_qty, avg = self.api.wait_done(ident)
+        if exec_qty <= 0:
+            time.sleep(2.0)
+            exec_qty = max(0.0, self.api.balances(self.cfg.market)[1] - qty_before)
+            avg = price or 0.0
+        if exec_qty > 0:
+            self.store.open_position(exec_qty, avg or price or 0.0)
+            log(f"  Buy filled {exec_qty:.8f} {self.cfg.market.split('-')[1]} "
+                f"@ {avg:,.0f} KRW (status {state})")
+            sl = (avg or price or 0.0) * (1 - self.cfg.stop_loss_pct / 100)
+            self.alert(f"🟢 Buy filled\n{self.cfg.market} {exec_qty:.8f}\n"
+                       f"Fill price {avg:,.0f} KRW ({order_krw:,.0f} KRW total)\n"
+                       + (f"Stop level {sl:,.0f} KRW\n" if self.cfg.stop_loss_pct > 0 else "")
+                       + f"Reason: {reason}")
+        else:
+            log(f"  ⚠ Buy submitted but fill unconfirmed (status {state}). "
+                f"The balance will be checked again next cycle.")
+            self.alert(f"⚠️ Buy submitted but fill unconfirmed\n"
+                       f"{self.cfg.market} {order_krw:,.0f} KRW (status {state})\n"
+                       f"Check the order history in the Upbit app.")
+        log_order({"timestamp": fmt(now_kst()), "side": "buy", "reason": reason, "market": self.cfg.market,
+                   "quantity": f"{exec_qty:.8f}", "fill_price": f"{avg:.0f}" if avg else "",
+                   "amount": f"{order_krw:.0f}",
+                   "mode": "live" if exec_qty > 0 else "live (unconfirmed)",
+                   "order_id": res.get("uuid") or ident})
+
+    def sell(self, price: Optional[float], bar_iso: str, reason: str) -> None:
+        pos = self.store.state.position
+        qty = int(pos.qty * 1e8) / 1e8          # Truncate to eight decimals; rounding up could exceed the balance.
+        if qty <= 0:
+            log("  Skipping sell: no bot-owned position")
+            self.store.close_position()
+            return
+        # Unsellable dust would otherwise trigger retries on every bar.
+        if price and qty * price < self.cfg.min_order_krw:
+            log(f"  ⚠ Remaining quantity {qty:.8f} is valued at {qty * price:,.0f} KRW, below the minimum order amount"
+                f"({self.cfg.min_order_krw:,.0f} KRW); unable to sell.\n"
+                f"     → The bot abandons this dust position and waits for the next signal. "
+                f"You can manage it directly in the Upbit app.")
+            self.store.close_position()
+            return
+        ident = self._identifier(bar_iso, "ask")
+        if self.cfg.dry_run:
+            log(f"  [dry run] sell {qty:.8f} (approximate price {price:,.0f} KRW)" if price
+                else f"  [dry run] sell {qty:.8f}")
+            pnl = ((price / pos.entry_price - 1) * 100) if (price and pos.entry_price) else None
+            self.store.close_position()
+            self.alert(f"🔴 sell\n{self.cfg.market} {qty:.8f}\n"
+                       + (f"Price {price:,.0f} KRW ({pnl:+.2f}%)\n" if pnl is not None else "")
+                       + f"Reason: {reason}")
+            log_order({"timestamp": fmt(now_kst()), "side": "sell", "reason": reason,
+                       "market": self.cfg.market, "quantity": f"{qty:.8f}", "fill_price": price or "",
+                       "amount": f"{qty * (price or 0):.0f}", "mode": "dry run", "order_id": ident})
+            return
+
+        try:
+            res = self.api.order({"market": self.cfg.market, "side": "ask", "ord_type": "market",
+                                  "volume": f"{qty:.8f}", "identifier": ident})
+        except UpbitError as e:
+            if e.code in ("under_min_total_ask", "insufficient_funds_ask"):
+                log(f"  ⚠ Upbit rejected the sell order: {e}\n"
+                    f"     → Remaining quantity({qty:.8f}) is too small to sell. "
+                    f"The bot abandons this dust position and waits for the next signal.")
+                self.store.close_position()
+                return
+            raise
+        state, exec_qty, avg = self.api.wait_done(ident)
+        remain = self.api.balances(self.cfg.market)[1]
+        if remain < pos.qty * 0.001:
+            entry = pos.entry_price
+            self.store.close_position()
+            log(f"  Sell filled {exec_qty or qty:.8f} @ {avg:,.0f} KRW (status {state})")
+            pnl = ((avg / entry - 1) * 100) if (avg and entry) else None
+            self.alert(f"🔴 Sell filled\n{self.cfg.market} {exec_qty or qty:.8f}\n"
+                       f"Fill price {avg:,.0f} KRW"
+                       + (f" ({pnl:+.2f}%)\n" if pnl is not None else "\n")
+                       + f"Reason: {reason}")
+        else:
+            self.store.mark_pending_exit(min(pos.qty, remain))
+            log(f"  ⚠ Sell partially filled (Remaining quantity {remain:.8f}). "
+                f"The remaining position will be closed regardless of the next signal.")
+        log_order({"timestamp": fmt(now_kst()), "side": "sell", "reason": reason, "market": self.cfg.market,
+                   "quantity": f"{exec_qty or qty:.8f}", "fill_price": f"{avg:.0f}" if avg else "",
+                   "amount": f"{(exec_qty or qty) * (avg or price or 0):.0f}", "mode": "live",
+                   "order_id": res.get("uuid") or ident})
 
 
-def math_floor_krw(x: float) -> float:
-    return float(int(x))
+    def cycle(self) -> None:
+        cfg = self.cfg
+        bars = self.fetch_bars()
+        price = self.api.last_price(cfg.market)
+        krw, coin_qty = self.read_account(price)
+
+        warn = self.store.reconcile(coin_qty)
+        if warn:
+            log(f"  ⚠ {warn}")
+            self.alert(f"⚠️ Account balance differs from bot records\n{warn}")
+
+        pos = self.store.state.position
+        today = now_kst().strftime("%Y-%m-%d")
+        if not pos.is_open and price and coin_qty * price >= cfg.min_order_krw:
+            if self.store.state.orphan_notified != today:
+                self.store.state.orphan_notified = today
+                self.store.save()
+                msg = (f"Account contains {coin_qty:.8f} {cfg.market.split('-')[1]}"
+                       f"({coin_qty * price:,.0f} KRW) not tracked by the bot.\n"
+                       f"Manually acquired holdings are left untouched.\n"
+                       f"Investigate if these are bot-owned holdings with missing state.")
+                log(f"  ⚠ {msg}")
+                self.alert(f"⚠️ Untracked holdings detected\n{msg}")
+        bar_iso = bars.index[-1].isoformat()
+        close = float(bars["close"].iloc[-1])
+        # Use the latest close if the price request fails; entry price would hide losses.
+        mark = price or close
+        equity = krw + pos.qty * mark
+        if self.store.roll_day(equity):
+            log(f"  Starting daily reference equity: {equity:,.0f} KRW")
+
+        if cfg.daily_loss_limit_pct > 0:
+            loss = self.store.day_loss_pct(equity)
+            if loss <= -cfg.daily_loss_limit_pct:
+                why = (f"Daily loss {loss:.2f}% exceeds the configured limit ({cfg.daily_loss_limit_pct:g}%)."
+                       f"\nStarting equity {self.store.state.day_start_equity:,.0f} KRW "
+                       f"→ Current {equity:,.0f} KRW")
+                self.stop.raise_flag(why)
+                log(f"  ■ Stopping: daily loss limit exceeded\n{why}")
+                self.last_error = "Stopped: daily loss limit exceeded (see stop file in out/)"
+                self.write_status(mark, krw)
+                self.alert(f"🛑 The bot has stopped\n{why}\n\n"
+                           f"Review the account, delete the stop file in out/, and restart.")
+                raise SystemExit(0)
+
+        if self.store.state.pending_exit and pos.is_open:
+            action, reason = "SELL", "Close remaining position"
+        else:
+            action, reason = decide_last_bar(bars, cfg, pos.is_open, pos.entry_price)
+        self.last_decision = f"{reason} ({fmt(bars.index[-1].to_pydatetime())}  bars)"
+
+        bar_end = bars.index[-1].to_pydatetime() + timedelta(hours=cfg.bar_hours)
+        age_min = (self.api.now_utc() - bar_end).total_seconds() / 60.0
+        if age_min > cfg.bar_hours * 60 + 30:
+            log(f"  ⚠ Market data is {age_min / 60:.1f} hours old. Upbit may be under maintenance or "
+                f"market data has stopped updating. Skipping this decision.")
+            return
+        if action == "BUY" and cfg.signal_max_age_min > 0 and age_min > cfg.signal_max_age_min:
+            log(f"  Buy deferred: signal bar closed {age_min:.0f} minutes ago "
+                f"(allowed {cfg.signal_max_age_min:g} minutes). Stale entry signals are ignored.")
+            action = None
+            reason = f"Stale signal({age_min:.0f} minutes ago)"
+            self.last_decision = f"{reason} — Buy deferred"
+
+        held = f"holding {pos.qty:.8f} (Entry price {pos.entry_price:,.0f} KRW)" if pos.is_open else "No position"
+        log(f"   bars {fmt(bars.index[-1].to_pydatetime())} Close {close:,.0f} KRW | {held} | "
+            f"KRW balance {krw:,.0f} KRW → {action or 'wait'} ({reason})")
+
+        if not action:
+            return
+        # Record the attempt before submitting: a lost response followed by restart
+        # must not create another buy for the same bar.
+        if self.store.state.last_bar_attempted == bar_iso:
+            log(f"  Skipping: bar({bar_iso}) was already processed")
+            return
+        self.store.state.last_bar_attempted = bar_iso
+        self.store.save()
+
+        if action == "BUY":
+            self.buy(krw, price, bar_iso, reason, close)
+        else:
+            self.store.want_exit()
+            self.sell(price, bar_iso, reason)
 
 
-def math_floor8(x: float) -> float:
-    return int(x * 1e8) / 1e8
+    def watch_between_bars(self) -> None:
+        st = self.store.state
+        pos = st.position
+        if not pos.is_open:
+            return
+        if not st.pending_exit and self.cfg.stop_loss_pct <= 0:
+            return
+        price = self.api.last_price(self.cfg.market)
+        if not price:
+            return
+        # Keep monitoring identifiers distinct from bar-based identifiers.
+        stamp = "w" + now_kst().strftime("%Y%m%d%H%M")
+        if st.pending_exit:
+            log(f"  Exit incomplete: retrying remaining {pos.qty:.8f} units")
+            self.sell(price, stamp, "Close remaining position")
+        elif stop_loss_hit(pos.entry_price, price, self.cfg.stop_loss_pct):
+            log(f"  ■ Stop level reached — Entry price {pos.entry_price:,.0f} KRW versus current {price:,.0f} KRW "
+                f"({(price / pos.entry_price - 1) * 100:+.2f}%). Selling immediately")
+            self.store.want_exit()
+            self.sell(price, stamp, REASON_STOP)
 
 
-_STATE_PATH = os.path.join(OUT_DIR, "state.json")
+    def write_status(self, price: Optional[float], krw: Optional[float]) -> None:
+        cfg = self.cfg
+        pos = self.store.state.position
+        lines = [
+            "=" * 46,
+            "  Bitcoin Trading Bot — Status",
+            "=" * 46,
+            f"Updated at   : {fmt(now_kst())}",
+            f"Mode   : {'Dry run (no orders submitted)' if cfg.dry_run else '★ LIVE ORDERS ★'}",
+            f"Market / timeframe   : {cfg.market} / {cfg.timeframe}",
+            f"strategy        : {cfg.strategy} | stop loss "
+            f"{f'{cfg.stop_loss_pct:g}%' if cfg.stop_loss_pct else 'None'} | "
+            f"Allocation {cfg.position_pct:g}%",
+            "",
+        ]
+        if pos.is_open:
+            cur = price or 0.0
+            pnl = (cur / pos.entry_price - 1.0) * 100.0 if pos.entry_price else 0.0
+            lines += [
+                f"Position   : Holding  {pos.qty:.8f}",
+                f"Entry price      : {pos.entry_price:,.0f} KRW  ({pos.entry_time})",
+                f"Current price      : {cur:,.0f} KRW  ({pnl:+.2f}%)",
+            ]
+            if cfg.stop_loss_pct > 0:
+                lines.append(f"Stop level      : {pos.entry_price * (1 - cfg.stop_loss_pct / 100):,.0f} KRW")
+        else:
+            lines.append("Position   : No position (cash)")
+        lines += [
+            f"KRW balance   : {krw:,.0f} KRW" if krw is not None else
+            "KRW balance   : Unavailable (see error below)",
+            "",
+            f"Last decision : {self.last_decision}",
+            f"Last trade : {self.store.state.last_trade_time or 'None yet'}",
+            f"Next check   : {fmt(self.next_wake) if self.next_wake else '-'}",
+            "",
+            f"Last error   : {self.last_error or 'None'}",
+            "",
+        ]
+        if cfg.dry_run and not (cfg.access_key and cfg.secret_key):
+            lines.append("※ Dry run without keys: signals only; actual balances are unchanged.")
+        lines += [
+            "Historical results included frequent losing trades and a few large gains.",
+            "※ Losing streaks are possible. Review risk settings in README.md.",
+        ]
+        try:
+            with open(STATUS_PATH, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
+
+    def _alert_failure(self, detail: str) -> None:
+        n = self.fail_streak
+        if n in (3, 10) or (n > 10 and n % 20 == 0):
+            self.alert(f"⚠️ Consecutive failures: {n} occurrences\n{detail}\n\n"
+                       f"Retrying. Check your connection, API keys, and Upbit service status.")
+
+    def maybe_heartbeat(self, price: Optional[float], krw: Optional[float]) -> None:
+        now = now_kst()
+        today = now.strftime("%Y-%m-%d")
+        if self.store.state.heartbeat_date == today or now.hour < self.cfg.heartbeat_hour:
+            return
+        self.store.state.heartbeat_date = today
+        self.store.save()
+        pos = self.store.state.position
+        if pos.is_open and price and pos.entry_price:
+            held = (f"Holding {pos.qty:.8f}\nEntry price {pos.entry_price:,.0f} KRW → "
+                    f"Current {price:,.0f} KRW ({(price / pos.entry_price - 1) * 100:+.2f}%)")
+        else:
+            held = "No position (cash)"
+        self.alert(f"🔔 Trading bot heartbeat\n{fmt(now)}\n\n{held}\n"
+                   + (f"KRW balance {krw:,.0f} KRW\n" if krw is not None else "")
+                   + f"Last trade: {self.store.state.last_trade_time or 'None yet'}\n"
+                   + (f"\n⚠️ Last error: {self.last_error}" if self.last_error else ""))
 
 
-def _load_last_acted_bar() -> str:
-    try:
-        with open(_STATE_PATH, "r", encoding="utf-8") as f:
-            return str(json.load(f).get("last_acted_bar") or "")
-    except (OSError, ValueError, json.JSONDecodeError):
-        return ""
+    def next_bar_close(self) -> datetime:
+        """Next bar close plus ten seconds, including a just-closed bar in its grace period."""
+        now = self.api.now_utc().astimezone(timezone.utc)
+        h = self.cfg.bar_hours
+        base = now.replace(minute=0, second=0, microsecond=0)
+        cand = base - timedelta(hours=base.hour % h) + timedelta(seconds=10)
+        while cand <= now:
+            cand += timedelta(hours=h)
+        return cand.astimezone(KST)
 
+    def run(self, once: bool = False) -> None:
+        warn = self.store.load()
+        if warn:
+            log(f"⚠ {warn}")
+        if self.stop.active:
+            print(f"\n{'=' * 50}\nThe bot is stopped.\n\n{self.stop.reason()}\n{'=' * 50}")
+            return
 
-def _save_last_acted_bar(bar_iso: str) -> None:
-    try:
-        os.makedirs(OUT_DIR, exist_ok=True)
-        with open(_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"last_acted_bar": bar_iso}, f)
-    except OSError as e:
-        _log(f"[WARN] state save failed: {e}")
+        log(f"■ Start\n{describe(self.cfg)}")
+        if not os.path.exists(ENV_PATH):
+            log("⚠ No .env found; using defaults in dry-run mode without API keys.\n"
+                "     → Copy .env.example to .env and fill in your keys.\n"
+                "     → Ensure the filename is .env, not .env.txt.\n"
+                f"     → Expected path: {ENV_PATH}")
+        if not self.cfg.dry_run:
+            log("LIVE MODE: real funds will be traded.")
 
+        noti_err = notify.check(self.cfg)
+        if noti_err:
+            log(f"⚠ Notifications unavailable: {noti_err}\n"
+                "     -> Check both TELEGRAM_ settings in .env to receive failure notifications.")
+        else:
+            log("  Notifications connected: trades, errors, and stops will be sent to Telegram")
+            self.alert(f"▶️ Starting trading bot\n{self.cfg.market} / {self.cfg.timeframe} / "
+                       f"{self.cfg.strategy}\n"
+                       f"{'Dry run (no orders)' if self.cfg.dry_run else 'LIVE MODE'}")
 
-def run_cycle() -> None:
-    df = fetch_1h_closed()
-    if len(df) < WARMUP_HOURS:
-        _log(f"[WAIT] completed bars {len(df)} < warmup {WARMUP_HOURS}")
-        return
-    last_px = fetch_last_price()
-    if DRY_RUN and not (ACCESS_KEY and SECRET_KEY):
-        krw, btc = 10_000_000.0, 0.0
-    else:
-        krw, btc = fetch_balances()
-    long_now = is_long(btc, last_px)
-    action = decide_last_bar(df, long_now)
-    last_bar = df.index[-1].isoformat()
-    if action and last_bar == _load_last_acted_bar():
-        _log(f"[SKIP] bar={last_bar} already processed this bar; suppressing restart replay")
-        action = None
-    _log(f"[CYCLE] bar={last_bar} long={long_now} krw={krw:,.0f} btc={btc:.8f} -> {action or 'HOLD'}")
-    if action == "BUY":
-        market_buy_all(krw, last_px)
-        _save_last_acted_bar(last_bar)
-    elif action == "SELL":
-        market_sell_all(btc, last_px)
-        _save_last_acted_bar(last_bar)
+        while True:
+            price: Optional[float] = None
+            krw: Optional[float] = None
+            try:
+                self.cycle()
+                self.last_error = ""
+                self.fail_streak = 0
+                price = self.api.last_price(self.cfg.market)
+                krw = self.read_account(price)[0]
+            except SystemExit:
+                raise
+            except ConfigError as e:
+                log(f"■ Stopping due to configuration error\n{e}")
+                self.alert(f"🛑 Stopped due to configuration error\n{e}")
+                raise SystemExit(2)     # Exit code 2 requires operator intervention; the supervisor must not restart.
+            except UpbitError as e:
+                self.last_error = f"{e} ({fmt(now_kst())})"
+                self.fail_streak += 1
+                log(f"⚠ {e.full()}")
+                self._alert_failure(e.full())
+            except Exception as e:
+                self.last_error = f"{type(e).__name__}: {e} ({fmt(now_kst())})"
+                self.fail_streak += 1
+                log(f"⚠ Unexpected error: {type(e).__name__}: {e}\n"
+                    f"     → Retrying next cycle. Investigate the traceback if this persists.\n"
+                    f"{traceback.format_exc()}")
+                self._alert_failure(f"{type(e).__name__}: {e}")
+
+            self.next_wake = self.next_bar_close()
+            self.write_status(price, krw)
+            self.maybe_heartbeat(price, krw)
+            if once:
+                log("■ Single check completed; exiting (--once)")
+                return
+            log(f"  Next check at {fmt(self.next_wake)}")
+            last_watch = 0.0
+            while now_kst() < self.next_wake:
+                if self.stop.active:
+                    log("■ Stop file detected; exiting")
+                    return
+                if time.monotonic() - last_watch >= 60.0:
+                    last_watch = time.monotonic()
+                    try:
+                        self.watch_between_bars()
+                    except UpbitError as e:
+                        log(f"⚠ Stop-loss check failed: {e}")
+                    except Exception as e:
+                        log(f"⚠ Unexpected stop-loss check error: {type(e).__name__}: {e}")
+                time.sleep(min(30.0, max(1.0, (self.next_wake - now_kst()).total_seconds())))
 
 
 def main() -> None:
-    if not DRY_RUN and not (ACCESS_KEY and SECRET_KEY):
-        raise SystemExit("Live mode (DRY_RUN=0) requires UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY.")
-    _log(f"[BOOT] coin engine — market={MARKET} dry_run={DRY_RUN} keys={'set' if ACCESS_KEY else 'none'}")
-    while True:
-        try:
-            run_cycle()
-        except Exception as e:
-            _log(f"[ERROR] cycle failed: {type(e).__name__}: {e}")
-        now = datetime.now(timezone.utc)
-        next_wake = (now.replace(minute=0, second=0, microsecond=0)
-                     + timedelta(hours=1, seconds=10))
-        _log(f"[SLEEP] until {next_wake.isoformat()}")
-        while datetime.now(timezone.utc) < next_wake:
-            time.sleep(min(30.0, max(0.5, (next_wake - datetime.now(timezone.utc)).total_seconds())))
+    once = "--once" in sys.argv
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"\n{e}\n")
+        sys.exit(2)                 # Exit code 2 requires operator intervention; do not auto-restart.
+    Bot(cfg).run(once=once)
 
 
 if __name__ == "__main__":

@@ -4,8 +4,10 @@ coin.cfg
 *.env
 
 # generated
+.venv/
 __pycache__/
 *.pyc
 *.log
 coin_backtest_output/
 out/
+.DS_Store

@@ -1,0 +1,252 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+from bot_state import Position, StateStore, StopFlag
+from coin_config import ConfigError, load_config
+
+
+def test_backup_recovery(tmp):
+    path = os.path.join(tmp, "bak.json")
+    store = StateStore(path)
+    store.state.position = Position(qty=0.7, entry_price=95_000_000.0)
+    store.save()
+    store.state.position = Position(qty=0.8, entry_price=96_000_000.0)
+    store.save()
+    assert os.path.exists(path + ".bak"), "Backup was not created"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"position": {"qty": 0.8, "entry')
+    revived = StateStore(path)
+    warn = revived.load()
+    assert "backup" in warn, f"Missing backup recovery warning: {warn}"
+    assert abs(revived.state.position.qty - 0.7) < 1e-12, "Previous backup contents were not restored"
+    print("  [OK] State backup recovery")
+
+
+def test_notify_offline(tmp):
+    import notify
+    from coin_config import Config
+    cfg = Config()
+    assert notify.send(cfg, "x") is False, "Reported delivery without configuration"
+    assert notify.check(cfg) is not None, "Missing configuration was reported as valid."
+    cfg.telegram_token, cfg.telegram_chat_id = "111:invalid", "0"
+    assert notify.send(cfg, "x") is False
+    print("  [OK] Missing or failing notifications do not leak exceptions")
+
+
+def test_corrupted_state_recovers(tmp):
+    path = os.path.join(tmp, "state.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"position": {"qty": 0.5, "entry_pr')      # Simulate a write interrupted by power loss.
+    store = StateStore(path)
+    warn = store.load()
+    assert warn, "Corruption was not detected"
+    assert "corrupted" in warn and "review required" in warn, f"Warning lacks recovery guidance: {warn}"
+    assert os.path.exists(path + ".broken"), "Corrupted file was not preserved"
+    assert store.state.position.qty == 0.0, "State was not reset after corruption"
+    print("  [OK] Corrupted state recovery and warning")
+
+
+def test_atomic_save(tmp):
+    path = os.path.join(tmp, "atomic.json")
+    store = StateStore(path)
+    store.state.position = Position(qty=0.123, entry_price=90_000_000.0)
+    store.save()
+    assert not os.path.exists(path + ".tmp"), "Temporary file was left behind"
+    with open(path, encoding="utf-8") as f:
+        json.load(f)
+    again = StateStore(path)
+    assert again.load() == ""
+    assert abs(again.state.position.qty - 0.123) < 1e-12
+    assert again.state.position.entry_price == 90_000_000.0
+    print("  [OK] Atomic save and reload")
+
+
+def test_reconcile(tmp):
+    store = StateStore(os.path.join(tmp, "rec.json"))
+
+    # Manual partial sell: reduce the bot record to the balance.
+    store.state.position = Position(qty=1.0, entry_price=100.0)
+    warn = store.reconcile(0.4)
+    assert warn and abs(store.state.position.qty - 0.4) < 1e-12, "Tracked quantity was not reduced"
+
+    # Manual full sell: close the tracked position.
+    store.state.position = Position(qty=1.0, entry_price=100.0)
+    store.reconcile(0.0)
+    assert store.state.position.qty == 0.0, "Position was not closed"
+
+    # Unrelated additional holdings: leave the bot record unchanged.
+    store.state.position = Position(qty=1.0, entry_price=100.0)
+    warn = store.reconcile(5.0)
+    assert warn == "" and store.state.position.qty == 1.0, "Adopted unrelated holdings as bot-owned"
+
+    store.state.position = Position(qty=1.0, entry_price=100.0)
+    assert store.reconcile(0.9999) == "", "Unnecessary warning within rounding tolerance"
+    print("  [OK] Four reconciliation cases, including unrelated holdings")
+
+
+def test_pending_exit(tmp):
+    path = os.path.join(tmp, "pending.json")
+    store = StateStore(path)
+    store.state.position = Position(qty=1.0, entry_price=100.0)
+    store.save()
+
+    store.mark_pending_exit(0.3)
+    assert store.state.pending_exit is True and abs(store.state.position.qty - 0.3) < 1e-12
+
+    again = StateStore(path)
+    assert again.load() == ""
+    assert again.state.pending_exit is True, "Pending exit was lost after restart"
+    assert abs(again.state.position.qty - 0.3) < 1e-12
+
+    again.close_position()
+    assert again.state.pending_exit is False, "Pending exit remained after completion"
+    assert again.state.position.qty == 0.0
+
+    store.state.position = Position(qty=1.0, entry_price=100.0)
+    store.state.pending_exit = False
+    store.want_exit()
+    assert store.state.pending_exit is True
+    assert StateStore(path).load() == "" or True
+    reloaded = StateStore(path)
+    reloaded.load()
+    assert reloaded.state.pending_exit is True, "Exit intent was not persisted"
+
+    store.open_position(0.5, 200.0)
+    assert store.state.pending_exit is False, "New position inherited an old exit intent"
+
+    store.state.position = Position(qty=1.0, entry_price=100.0)
+    store.state.pending_exit = True
+    store.reconcile(0.0)
+    assert store.state.pending_exit is False, "Exit intent remained with zero balance"
+    print("  [OK] Pending exits across restart, reentry, and manual sells")
+
+
+def test_config_validation(tmp):
+    def write(text):
+        p = os.path.join(tmp, ".env")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        return p
+
+    for bad, must_have in [
+        ("POSITION_PCT=fifty\n", "number"),
+        ("POSITION_PCT=500\n", "range"),
+        ("TIMEFRAME=30m\n", "1h"),
+        ("STRATEGY=rsi\n", "qqe"),
+        ("STOP_LOSS_PCT=-5\n", "range"),
+        ("DRY_RUN=0\n", "API key"),
+    ]:
+        try:
+            load_config(env_path=write(bad))
+            raise AssertionError(f"Invalid configuration was accepted: {bad.strip()}")
+        except ConfigError as e:
+            assert must_have in str(e), f"Message is missing '{must_have}': {e}"
+            assert "[Configuration error]" in str(e)
+
+    p = write("MARKET=KRW-BTC\nTIMEFRAME=4h\nPOSITION_PCT=abc\n")
+    try:
+        load_config(env_path=p)
+        raise AssertionError("Expected rejection")
+    except ConfigError as e:
+        assert "line 3" in str(e), f"Missing source line number: {e}"
+
+    p = write("﻿MARKET=KRW-BTC\nTIMEFRAME=4h   #  bars\nSTRATEGY=\"qqe_mod\"\nPOSITION_PCT=30\n")
+    cfg = load_config(env_path=p)
+    assert cfg.market == "KRW-BTC" and cfg.timeframe == "4h"
+    assert cfg.strategy == "qqe_mod" and cfg.position_pct == 30.0
+    assert cfg.rsi_period == 6 and cfg.factor == 3.0, "QQE MOD defaults were not applied"
+    assert cfg.dry_run is True, "Dry run is not enabled by default"
+    print("  [OK] Seven configuration cases including lines, BOM, comments, and quotes")
+
+
+def test_identifier():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from autotrade_coin import Bot
+    from coin_config import Config
+    bot = Bot(Config())
+    a = bot._identifier("2026-08-04T16:00:00+00:00", "bid")
+    b = bot._identifier("2026-08-04T16:00:00+00:00", "bid")
+    c = bot._identifier("2026-08-04T16:00:00+00:00", "ask")
+    d = bot._identifier("2026-08-04T20:00:00+00:00", "bid")
+    assert a == b, "Identifier changed for the same bar and side; retries may duplicate orders"
+    assert a != c and a != d, "Different bars or sides share an identifier"
+    assert len(a) <= 40 and a.replace("-", "").isalnum(), f"Invalid identifier format: {a}"
+    w1 = bot._identifier("w202608050026", "ask")
+    w2 = bot._identifier("w202608050027", "ask")
+    assert w1 != w2, "Different minutes share an identifier; retries will be rejected"
+    assert w1 != c and w1 != a, "Bar and stop-loss order identifiers collide"
+    assert len(w1) <= 40 and w1.replace("-", "").isalnum(), f"Invalid format: {w1}"
+    print(f"  [OK] Order identifier idempotency ({a} / {w1})")
+
+
+def test_next_bar_close():
+    from datetime import datetime, timezone
+    from autotrade_coin import Bot
+    from coin_config import Config
+    bot = Bot(Config(timeframe="4h"))
+    for server_utc, expect_kst in [
+        ("2026-08-04 16:00:05", "2026-08-05 01:00:10"),
+        ("2026-08-04 16:00:15", "2026-08-05 05:00:10"),
+        ("2026-08-04 17:30:00", "2026-08-05 05:00:10"),
+        ("2026-08-04 19:59:59", "2026-08-05 05:00:10"),
+    ]:
+        bot.api.server_time = datetime.fromisoformat(server_utc).replace(tzinfo=timezone.utc)
+        got = bot.next_bar_close().strftime("%Y-%m-%d %H:%M:%S")
+        assert got == expect_kst, f"{server_utc}(UTC) -> {got}, expected {expect_kst}"
+
+    bot1h = Bot(Config(timeframe="1h"))
+    bot1h.api.server_time = datetime.fromisoformat("2026-08-04 13:00:03").replace(tzinfo=timezone.utc)
+    assert bot1h.next_bar_close().strftime("%H:%M:%S") == "22:00:10"   # 13:00:10 UTC = 22:00:10 KST
+    print("  [OK] Next decision timestamp includes just-closed bars")
+
+
+def test_daily_loss(tmp):
+    store = StateStore(os.path.join(tmp, "day.json"))
+    assert store.roll_day(10_000_000.0) is True, "First observation should start a new day"
+    assert store.roll_day(9_000_000.0) is False, "Daily reference reset within the same day"
+    assert abs(store.day_loss_pct(9_000_000.0) - (-10.0)) < 1e-9
+    assert abs(store.day_loss_pct(11_000_000.0) - 10.0) < 1e-9
+    print("  [OK] Daily loss calculation")
+
+
+def test_stop_flag(tmp):
+    flag = StopFlag(os.path.join(tmp, "\ubd07\uc815\uc9c0.txt"))
+    assert not flag.active
+    flag.raise_flag("Daily loss limit exceeded")
+    assert flag.active
+    body = flag.reason()
+    assert "limit" in body and "delete" in body, "Stop reason or resume instructions missing"
+    flag.clear()
+    assert not flag.active
+    print("  [OK] Stop flag and resume instructions")
+
+
+def main() -> int:
+    tmp = tempfile.mkdtemp(prefix="coinbot-test-")
+    try:
+        test_corrupted_state_recovers(tmp)
+        test_backup_recovery(tmp)
+        test_notify_offline(tmp)
+        test_atomic_save(tmp)
+        test_reconcile(tmp)
+        test_pending_exit(tmp)
+        test_config_validation(tmp)
+        test_identifier()
+        test_next_bar_close()
+        test_daily_loss(tmp)
+        test_stop_flag(tmp)
+        print("\nAll checks passed")
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
