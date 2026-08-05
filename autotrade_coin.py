@@ -371,7 +371,7 @@ class Bot:
         if cfg.dry_run and not (cfg.access_key and cfg.secret_key):
             lines.append("※ Dry run without keys: signals only; actual balances are unchanged.")
         lines += [
-            "Historical results included frequent losing trades and a few large gains.",
+            "※ Historical results included frequent losing trades and a few large gains.",
             "※ Losing streaks are possible. Review risk settings in README.md.",
         ]
         try:

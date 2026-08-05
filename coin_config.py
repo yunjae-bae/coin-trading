@@ -8,8 +8,18 @@ from typing import Any, Dict, Optional, Tuple
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 
-TIMEFRAMES = ("1h", "4h")
+TIMEFRAMES = ("1h", "2h", "3h", "4h", "6h", "8h", "12h", "1d")
 STRATEGIES = ("qqe", "qqe_mod")
+
+
+def tf_hours(timeframe: str) -> int:
+    tf = timeframe.strip().lower()
+    if tf.endswith("d"):
+        return int(tf[:-1] or 1) * 24
+    if tf.endswith("h"):
+        return int(tf[:-1] or 1)
+    raise ConfigError(f"[Configuration error] TIMEFRAME '{timeframe}' is unknown "
+                      f"({' / '.join(TIMEFRAMES)}; choose one)")
 
 
 class ConfigError(Exception):
@@ -35,7 +45,7 @@ def read_env_file(path: str = ENV_PATH) -> Dict[str, Tuple[str, int]]:
 @dataclass
 class Config:
     market: str = "KRW-BTC"
-    timeframe: str = "1h"
+    timeframe: str = "6h"
     strategy: str = "qqe"
     position_pct: float = 50.0
     max_order_krw: float = 0.0            # Maximum KRW per buy; zero means unlimited.
@@ -67,7 +77,7 @@ class Config:
 
     @property
     def bar_hours(self) -> int:
-        return 1 if self.timeframe == "1h" else 4
+        return tf_hours(self.timeframe)
 
 
 def _get(env: Dict[str, Tuple[str, int]], key: str) -> Tuple[Optional[str], int]:
@@ -108,7 +118,7 @@ def load_config(overrides: Optional[Dict[str, Any]] = None, env_path: str = ENV_
     env = read_env_file(env_path)
     cfg = Config(
         market=(_get(env, "MARKET")[0] or "KRW-BTC").upper(),
-        timeframe=_choice(env, "TIMEFRAME", "1h", TIMEFRAMES),
+        timeframe=_choice(env, "TIMEFRAME", "6h", TIMEFRAMES),
         strategy=_choice(env, "STRATEGY", "qqe", STRATEGIES),
         position_pct=_num(env, "POSITION_PCT", 50.0, 1.0, 100.0),
         max_order_krw=_num(env, "MAX_ORDER_KRW", 0.0, 0.0, 10_000_000_000.0),

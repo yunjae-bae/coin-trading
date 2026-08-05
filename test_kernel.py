@@ -25,6 +25,22 @@ def cfgs():
             Config(strategy="qqe_mod", rsi_period=6, factor=3.0)]
 
 
+def test_converges_on_live_timeframe(df):
+    cfg = Config(strategy="qqe_mod", rsi_period=6, factor=3.0, timeframe="6h")
+    bars = resample_ohlcv(df, cfg.timeframe)
+    need = warmup_bars(cfg)
+    full = compute_signals(bars, cfg)
+    mismatch = 0
+    for end in range(len(bars) - 200, len(bars)):
+        part = compute_signals(bars.iloc[max(0, end - need + 1):end + 1], cfg)
+        ts = bars.index[end]
+        if (bool(part.iloc[-1]["entry"]) != bool(full.loc[ts, "entry"]) or
+                bool(part.iloc[-1]["exit"]) != bool(full.loc[ts, "exit"])):
+            mismatch += 1
+    assert mismatch == 0, f"6h: {need} bars insufficient; mismatches among 200 samples: {mismatch} mismatches"
+    print(f"  [OK] Live timeframe (6h): last {need} bars match full history (200 samples from {len(bars)} bars)")
+
+
 def test_no_lookahead(df):
     for cfg in cfgs():
         full = compute_signals(df, cfg)
@@ -141,6 +157,7 @@ def main() -> int:
     test_rsi_reference(df)
     test_stop_loss()
     test_resample_drops_incomplete(df)
+    test_converges_on_live_timeframe(df)
     test_no_lookahead(df)
     test_live_matches_backtest(df)
     test_partial_data_converges(df)

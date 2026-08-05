@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from coin_config import Config
+from coin_config import Config, tf_hours
 
 REASON_ENTRY = "QQE bullish reversal"
 REASON_EXIT = "QQE bearish reversal"
@@ -127,10 +127,10 @@ def warmup_bars(cfg: Config) -> int:
 
 def resample_ohlcv(df_1h: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """Discard bars missing any constituent hour."""
-    if timeframe == "1h":
-        return df_1h.sort_index()
-    hours = 4
+    hours = tf_hours(timeframe)
     df = df_1h.sort_index()
+    if hours == 1:
+        return df
     agg = df.resample(f"{hours}h", label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
     counts = df["close"].resample(f"{hours}h", label="left", closed="left").count()
