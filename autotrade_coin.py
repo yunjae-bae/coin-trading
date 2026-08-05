@@ -12,7 +12,7 @@ from typing import Optional, Tuple
 import pandas as pd
 
 import notify
-from bot_state import KST, StateStore, StopFlag, fmt, now_kst
+from bot_state import KST, RunLock, StateStore, StopFlag, fmt, now_kst
 from coin_config import BASE_DIR, ENV_PATH, Config, ConfigError, describe, load_config
 from coin_kernel import (REASON_STOP, compute_signals, decide_last_bar, resample_ohlcv,
                          stop_loss_hit, warmup_bars)
@@ -24,6 +24,7 @@ ORDERS_PATH = os.path.join(OUT_DIR, "\uc8fc\ubb38\ub0b4\uc5ed.csv")
 STATUS_PATH = os.path.join(OUT_DIR, "status.txt")
 STATE_PATH = os.path.join(OUT_DIR, "state.json")
 STOP_PATH = os.path.join(OUT_DIR, "\ubd07\uc815\uc9c0.txt")
+LOCK_PATH = os.path.join(OUT_DIR, "\uc2e4\ud589\uc911.lock")
 
 ORDER_HEADER = ["timestamp", "side", "reason", "market", "quantity", "fill_price", "amount", "mode", "order_id"]
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -66,6 +67,7 @@ class Bot:
         self.api = Upbit(cfg.access_key, cfg.secret_key)
         self.store = StateStore(STATE_PATH)
         self.stop = StopFlag(STOP_PATH)
+        self.lock = RunLock(LOCK_PATH)
         self.last_error = ""
         self.last_decision = "-"
         self.fail_streak = 0
@@ -422,6 +424,13 @@ class Bot:
         if self.stop.active:
             print(f"\n{'=' * 50}\nThe bot is stopped.\n\n{self.stop.reason()}\n{'=' * 50}")
             return
+        if self.lock.held_by_other():
+            print(f"\n{'=' * 50}\nAnother bot instance is already running.\n"
+                  f"Running two instances may corrupt shared state.\n\n"
+                  f"Close this window and keep the existing instance running.\n"
+                  f"(If the other instance has stopped, wait two minutes before restarting)\n{'=' * 50}")
+            return
+        self.lock.touch()
 
         log(f"■ Start\n{describe(self.cfg)}")
         if not os.path.exists(ENV_PATH):
@@ -470,6 +479,7 @@ class Bot:
                     f"{traceback.format_exc()}")
                 self._alert_failure(f"{type(e).__name__}: {e}")
 
+            self.lock.touch()
             self.next_wake = self.next_bar_close()
             self.write_status(price, krw)
             self.maybe_heartbeat(price, krw)
@@ -479,8 +489,10 @@ class Bot:
             log(f"  Next check at {fmt(self.next_wake)}")
             last_watch = 0.0
             while now_kst() < self.next_wake:
+                self.lock.touch()
                 if self.stop.active:
                     log("■ Stop file detected; exiting")
+                    self.lock.release()
                     return
                 if time.monotonic() - last_watch >= 60.0:
                     last_watch = time.monotonic()
@@ -500,7 +512,11 @@ def main() -> None:
     except ConfigError as e:
         print(f"\n{e}\n")
         sys.exit(2)                 # Exit code 2 requires operator intervention; do not auto-restart.
-    Bot(cfg).run(once=once)
+    bot = Bot(cfg)
+    try:
+        bot.run(once=once)
+    finally:
+        bot.lock.release()
 
 
 if __name__ == "__main__":

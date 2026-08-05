@@ -167,6 +167,39 @@ class StateStore:
         return (equity / base - 1.0) * 100.0
 
 
+class RunLock:
+    STALE_SEC = 120
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def _age(self) -> Optional[float]:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                t = datetime.fromisoformat(f.read().strip())
+            return (now_kst() - t).total_seconds()
+        except (OSError, ValueError):
+            return None
+
+    def held_by_other(self) -> bool:
+        age = self._age()
+        return age is not None and 0 <= age < self.STALE_SEC
+
+    def touch(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(now_kst().isoformat())
+        except OSError:
+            pass
+
+    def release(self) -> None:
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+
 class StopFlag:
 
     def __init__(self, path: str):

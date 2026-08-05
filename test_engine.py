@@ -216,6 +216,30 @@ def test_daily_loss(tmp):
     print("  [OK] Daily loss calculation")
 
 
+def test_run_lock(tmp):
+    from datetime import timedelta
+    from bot_state import RunLock, now_kst
+    path = os.path.join(tmp, "\uc2e4\ud589\uc911.lock")
+    lock = RunLock(path)
+
+    assert not lock.held_by_other(), "Nonexistent lock reported as active"
+    lock.touch()
+    assert lock.held_by_other(), "Fresh lock not detected; duplicate instance allowed"
+    lock.release()
+    assert not lock.held_by_other(), "Lock remained after release"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write((now_kst() - timedelta(seconds=RunLock.STALE_SEC + 10)).isoformat())
+    assert not lock.held_by_other(), "Stale lock prevented restart"
+
+    assert RunLock.STALE_SEC < 180, "Lock timeout exceeds restart delay and prevents recovery"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("invalid contents")
+    assert not lock.held_by_other(), "Broken lock prevented startup"
+    print("  [OK] Duplicate-run guard tolerates stale and corrupt locks")
+
+
 def test_stop_flag(tmp):
     flag = StopFlag(os.path.join(tmp, "\ubd07\uc815\uc9c0.txt"))
     assert not flag.active
@@ -241,6 +265,7 @@ def main() -> int:
         test_identifier()
         test_next_bar_close()
         test_daily_loss(tmp)
+        test_run_lock(tmp)
         test_stop_flag(tmp)
         print("\nAll checks passed")
         return 0
