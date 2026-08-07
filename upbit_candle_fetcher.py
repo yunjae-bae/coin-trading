@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pandas as pd
 import requests
@@ -16,8 +15,8 @@ SLEEP_SEC = 0.15
 MAX_RETRY = 5
 
 
-def fetch_page(market: str, to_utc: Optional[str], count: int = 200) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {"market": market, "count": count}
+def fetch_page(market: str, to_utc: str | None, count: int = 200) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"market": market, "count": count}
     if to_utc:
         params["to"] = to_utc
     for attempt in range(MAX_RETRY):
@@ -30,21 +29,21 @@ def fetch_page(market: str, to_utc: Optional[str], count: int = 200) -> List[Dic
     raise RuntimeError(f"{market}: {MAX_RETRY} consecutive HTTP 429 responses; retry later")
 
 
-def rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+def rows_to_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["candle_date_time_utc"], errors="coerce").dt.tz_localize(timezone.utc)
+    df["ts"] = pd.to_datetime(df["candle_date_time_utc"], errors="coerce").dt.tz_localize(UTC)
     df = df.rename(columns={"opening_price": "open", "high_price": "high", "low_price": "low",
                             "trade_price": "close", "candle_acc_trade_volume": "volume"})
     df = df.dropna(subset=["ts"]).set_index("ts").sort_index()
     return df[["open", "high", "low", "close", "volume"]].astype(float)
 
 
-def fetch_history(market: str, start_utc: datetime, stop_at: Optional[datetime] = None) -> pd.DataFrame:
+def fetch_history(market: str, start_utc: datetime, stop_at: datetime | None = None) -> pd.DataFrame:
     """Fetch backwards to start_utc; stop at stop_at when updating existing data."""
-    frames: List[pd.DataFrame] = []
-    to: Optional[str] = None
+    frames: list[pd.DataFrame] = []
+    to: str | None = None
     total = 0
     while True:
         rows = fetch_page(market, to)
@@ -77,16 +76,17 @@ def main() -> None:
     os.makedirs(args.outdir, exist_ok=True)
     path = os.path.join(args.outdir, f"{args.market}.parquet")
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     start_utc = now_utc - timedelta(days=args.days)
 
-    existing: Optional[pd.DataFrame] = None
-    stop_at: Optional[datetime] = None
+    existing: pd.DataFrame | None = None
+    stop_at: datetime | None = None
     if args.update and os.path.exists(path):
         existing = pd.read_parquet(path)
-        existing.index = pd.to_datetime(existing.index, utc=True)
-        if len(existing):
-            stop_at = existing.index.max().to_pydatetime()
+        idx = pd.DatetimeIndex(pd.to_datetime(existing.index, utc=True))
+        existing.index = idx
+        if len(idx):
+            stop_at = idx.max().to_pydatetime()
             print(f"[OK] Existing {len(existing)} bars, latest={stop_at.isoformat()} ; fetching newer bars")
 
     df_new = fetch_history(args.market, start_utc, stop_at=stop_at)

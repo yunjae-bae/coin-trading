@@ -1,12 +1,12 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any
 
 KST = timezone(timedelta(hours=9))
 
@@ -15,7 +15,7 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
-def fmt(dt: Optional[datetime]) -> str:
+def fmt(dt: datetime | None) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S") if dt else "-"
 
 
@@ -43,12 +43,11 @@ class State:
     orphan_notified: str = ""
     heartbeat_date: str = ""         # KST date of the last heartbeat.
 
-    def to_json(self) -> Dict[str, Any]:
-        d = asdict(self)
-        return d
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
 
     @classmethod
-    def from_json(cls, d: Dict[str, Any]) -> "State":
+    def from_json(cls, d: dict[str, Any]) -> State:
         pos = Position(**{k: v for k, v in (d.get("position") or {}).items()
                           if k in Position.__dataclass_fields__})
         rest = {k: v for k, v in d.items() if k in cls.__dataclass_fields__ and k != "position"}
@@ -60,10 +59,9 @@ class StateStore:
         self.path = path
         self.state = State()
 
-    def _read(self, path: str) -> bool:
-        with open(path, "r", encoding="utf-8") as f:
+    def _read(self, path: str) -> None:
+        with open(path, encoding="utf-8") as f:
             self.state = State.from_json(json.load(f))
-        return True
 
     def load(self) -> str:
         """Recover the backup on read failure; return a warning or an empty string."""
@@ -74,10 +72,8 @@ class StateStore:
             return ""
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
             broken = self.path + ".broken"
-            try:
+            with contextlib.suppress(OSError):
                 os.replace(self.path, broken)
-            except OSError:
-                pass
             bak = self.path + ".bak"
             if os.path.exists(bak):
                 try:
@@ -100,13 +96,11 @@ class StateStore:
             json.dump(self.state.to_json(), f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        with open(tmp, "r", encoding="utf-8") as f:
+        with open(tmp, encoding="utf-8") as f:
             json.load(f)
         if os.path.exists(self.path):
-            try:
+            with contextlib.suppress(OSError):
                 shutil.copy2(self.path, self.path + ".bak")
-            except OSError:
-                pass
         os.replace(tmp, self.path)
 
 
@@ -173,9 +167,9 @@ class RunLock:
     def __init__(self, path: str):
         self.path = path
 
-    def _age(self) -> Optional[float]:
+    def _age(self) -> float | None:
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
+            with open(self.path, encoding="utf-8") as f:
                 t = datetime.fromisoformat(f.read().strip())
             return (now_kst() - t).total_seconds()
         except (OSError, ValueError):
@@ -186,18 +180,14 @@ class RunLock:
         return age is not None and 0 <= age < self.STALE_SEC
 
     def touch(self) -> None:
-        try:
+        with contextlib.suppress(OSError):
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 f.write(now_kst().isoformat())
-        except OSError:
-            pass
 
     def release(self) -> None:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(self.path)
-        except OSError:
-            pass
 
 
 class StopFlag:
@@ -211,7 +201,7 @@ class StopFlag:
 
     def reason(self) -> str:
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
+            with open(self.path, encoding="utf-8") as f:
                 return f.read()
         except OSError:
             return "(Unable to read stop reason)"
@@ -227,7 +217,5 @@ class StopFlag:
                     f"  3. Restart the program.\n")
 
     def clear(self) -> None:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(self.path)
-        except OSError:
-            pass

@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -109,7 +106,7 @@ def qqe(close: pd.Series, rsi_period: int, sf: int, factor: float) -> pd.DataFra
     return out
 
 
-def _bollinger(s: pd.Series, length: int, mult: float) -> Tuple[pd.Series, pd.Series]:
+def _bollinger(s: pd.Series, length: int, mult: float) -> tuple[pd.Series, pd.Series]:
     basis = s.rolling(length).mean()
     dev = s.rolling(length).std(ddof=0) * mult
     return basis + dev, basis - dev
@@ -177,7 +174,7 @@ def stop_loss_hit(entry_price: float, price: float, stop_loss_pct: float) -> boo
 
 
 def decide_last_bar(df: pd.DataFrame, cfg: Config, currently_long: bool,
-                    entry_price: float = 0.0) -> Tuple[Optional[str], str]:
+                    entry_price: float = 0.0) -> tuple[str | None, str]:
     sig = compute_signals(df, cfg)
     if len(sig) == 0:
         return None, "No data"

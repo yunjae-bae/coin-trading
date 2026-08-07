@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -6,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+from datetime import UTC
 
 from bot_state import Position, StateStore, StopFlag
 from coin_config import ConfigError, load_config
@@ -29,15 +29,48 @@ def test_backup_recovery(tmp):
     print("  [OK] State backup recovery")
 
 
+class _FakeTelegram:
+
+    def __init__(self, *, token_ok: bool = True, send_ok: bool = True,
+                 reachable: bool = True):
+        self.token_ok = token_ok
+        self.send_ok = send_ok
+        self.reachable = reachable
+
+    def send_message(self, token: str, chat_id: str, text: str) -> bool:
+        import notify
+        if not self.reachable:
+            raise notify.Unreachable
+        return self.send_ok
+
+    def token_valid(self, token: str) -> bool:
+        import notify
+        if not self.reachable:
+            raise notify.Unreachable
+        return self.token_ok
+
+
 def test_notify_offline(tmp):
     import notify
     from coin_config import Config
-    cfg = Config()
-    assert notify.send(cfg, "x") is False, "Reported delivery without configuration"
-    assert notify.check(cfg) is not None, "Missing configuration was reported as valid."
-    cfg.telegram_token, cfg.telegram_chat_id = "111:invalid", "0"
-    assert notify.send(cfg, "x") is False
-    print("  [OK] Missing or failing notifications do not leak exceptions")
+
+    off = Config()
+    assert notify.send(off, "x") is False, "Reported delivery without configuration"
+    assert "not configured" in (notify.check(off) or "")
+
+    cfg = Config(telegram_token="t", telegram_chat_id="c")
+    for api, expect in [
+        (_FakeTelegram(token_ok=False), "TELEGRAM_TOKEN"),
+        (_FakeTelegram(send_ok=False), "TELEGRAM_CHAT_ID"),
+        (_FakeTelegram(reachable=False), "internet"),
+    ]:
+        msg = notify.check(cfg, api)
+        assert msg and expect in msg, f"Diagnostic does not identify '{expect}' as expected: {msg}"
+    assert notify.check(cfg, _FakeTelegram()) is None, "Valid configuration reported as an error"
+
+    assert notify.send(cfg, "x", _FakeTelegram(reachable=False)) is False
+    assert notify.send(cfg, "x", _FakeTelegram(send_ok=False)) is False
+    print("  [OK] Four notification diagnostics and failure isolation")
 
 
 def test_corrupted_state_recovers(tmp):
@@ -187,22 +220,26 @@ def test_identifier():
 
 
 def test_next_bar_close():
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     from autotrade_coin import Bot
     from coin_config import Config
-    bot = Bot(Config(timeframe="4h"))
+    from fake_exchange import FakeExchange
+
+    def at(server_utc: str) -> FakeExchange:
+        return FakeExchange(now=datetime.fromisoformat(server_utc).replace(tzinfo=UTC))
+
     for server_utc, expect_kst in [
         ("2026-08-04 16:00:05", "2026-08-05 01:00:10"),
         ("2026-08-04 16:00:15", "2026-08-05 05:00:10"),
         ("2026-08-04 17:30:00", "2026-08-05 05:00:10"),
         ("2026-08-04 19:59:59", "2026-08-05 05:00:10"),
     ]:
-        bot.api.server_time = datetime.fromisoformat(server_utc).replace(tzinfo=timezone.utc)
+        bot = Bot(Config(timeframe="4h"), at(server_utc))
         got = bot.next_bar_close().strftime("%Y-%m-%d %H:%M:%S")
         assert got == expect_kst, f"{server_utc}(UTC) -> {got}, expected {expect_kst}"
 
-    bot1h = Bot(Config(timeframe="1h"))
-    bot1h.api.server_time = datetime.fromisoformat("2026-08-04 13:00:03").replace(tzinfo=timezone.utc)
+    bot1h = Bot(Config(timeframe="1h"), at("2026-08-04 13:00:03"))
     assert bot1h.next_bar_close().strftime("%H:%M:%S") == "22:00:10"   # 13:00:10 UTC = 22:00:10 KST
     print("  [OK] Next decision timestamp includes just-closed bars")
 
@@ -218,6 +255,7 @@ def test_daily_loss(tmp):
 
 def test_run_lock(tmp):
     from datetime import timedelta
+
     from bot_state import RunLock, now_kst
     path = os.path.join(tmp, "\uc2e4\ud589\uc911.lock")
     lock = RunLock(path)

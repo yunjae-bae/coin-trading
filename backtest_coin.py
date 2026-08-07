@@ -1,184 +1,241 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, List, Optional
+from dataclasses import asdict, dataclass, field, replace
 
 import pandas as pd
 
-from coin_config import BASE_DIR, Config, describe, load_config
-from coin_kernel import (REASON_EXIT, REASON_STOP, compute_signals, resample_ohlcv,
-                         stop_loss_hit, warmup_bars)
+from coin_config import (
+    BASE_DIR,
+    MOD_FACTOR,
+    MOD_RSI_PERIOD,
+    Config,
+    describe,
+    load_config,
+)
+from coin_kernel import (
+    REASON_EXIT,
+    REASON_STOP,
+    compute_signals,
+    resample_ohlcv,
+    warmup_bars,
+)
 
 OUT_DIR = os.path.join(BASE_DIR, "coin_backtest_output")
+REASON_BUY = "entry"
 
 
-def simulate(bars: pd.DataFrame, sig: pd.DataFrame, cfg: Config, init_cash: float,
-             collect_rows: bool = False) -> Dict:
+@dataclass
+class Trade:
+
+    ts: pd.Timestamp
+    side: str
+    reason: str
+    price: float
+    qty: float
+    fee_krw: float
+    krw_after: float
+
+
+@dataclass
+class Result:
+    ret_pct: float
+    final: float
+    mdd_pct: float
+    bh_pct: float
+    round_trips: int
+    win_rate: float
+    stops: int
+    fees: float
+    bars: int
+    slippage_pct: float
+    start: pd.Timestamp
+    end: pd.Timestamp
+    equity: pd.DataFrame
+    trades: list[Trade] = field(default_factory=list)
+
+
+@dataclass
+class _Book:
+
+    krw: float
+    qty: float = 0.0
+    entry_price: float = 0.0
+    fees: float = 0.0
+    wins: int = 0
+    round_trips: int = 0
+    stops: int = 0
+
+    def buy(self, px: float, cfg: Config) -> tuple[float, float] | None:
+        """Return quantity and fee, or None below the minimum order."""
+        order_krw = (self.krw * cfg.position_pct / 100.0) / (1.0 + cfg.fee_rate)
+        if order_krw < cfg.min_order_krw:
+            return None
+        fee = order_krw * cfg.fee_rate
+        self.qty = order_krw / px
+        self.krw -= order_krw + fee
+        self.fees += fee
+        self.entry_price = px
+        return self.qty, fee
+
+    def sell(self, px: float, cfg: Config, *, is_stop: bool) -> tuple[float, float]:
+        """Return quantity and fee."""
+        sold = self.qty
+        gross = sold * px
+        fee = gross * cfg.fee_rate
+        self.krw += gross - fee
+        self.fees += fee
+        self.round_trips += 1
+        self.stops += int(is_stop)
+        self.wins += int(px > self.entry_price)
+        self.qty = 0.0
+        self.entry_price = 0.0
+        return sold, fee
+
+
+def _stop_fill(entry_price: float, low: float, bar_open: float, cfg: Config) -> float | None:
+    """Use the open price when a gap crosses the stop."""
+    stop_price = entry_price * (1.0 - cfg.stop_loss_pct / 100.0)
+    if low > stop_price:
+        return None
+    return min(stop_price, bar_open) * (1.0 - cfg.slippage_pct / 100.0)
+
+
+def _fill_price(raw_px: float, cfg: Config, *, is_buy: bool) -> float:
+    slip = cfg.slippage_pct / 100.0
+    return raw_px * (1.0 + slip) if is_buy else raw_px * (1.0 - slip)
+
+
+def _decide(holding: bool, entry: bool, exit_: bool, bars_since_exit: int,
+            cooldown_bars: int) -> str:
+    """Return an empty string when no order is due."""
+    if holding:
+        return "SELL" if exit_ else ""
+    if entry and bars_since_exit > cooldown_bars:
+        return "BUY"
+    return ""
+
+
+def simulate(bars: pd.DataFrame, sig: pd.DataFrame, cfg: Config, init_cash: float) -> Result:
     """Fill close signals at the next open; retain earlier history for warmup."""
-    opens = bars["open"].astype(float)
-    idx = list(sig.index)
-    warm = min(warmup_bars(cfg), max(0, len(idx) - 2))
+    if not sig.index.equals(bars.index):
+        raise ValueError("bars and sig indexes differ; prices and signals must align")
+    n = len(sig.index)
+    if n == 0:
+        raise ValueError("Empty signals; no bars to simulate")
 
-    krw = float(init_cash)
-    qty = 0.0
-    entry_price = 0.0
-    fees = 0.0
-    n_stop = 0
-    trades: List[dict] = []
-    equity: List[dict] = []
-    wins = 0
-    round_trips = 0
+    opens = bars["open"].to_numpy(dtype=float)
+    lows = bars["low"].to_numpy(dtype=float)
+    closes = sig["close"].to_numpy(dtype=float)
+    entries = sig["entry"].to_numpy(dtype=bool)
+    exits = sig["exit"].to_numpy(dtype=bool)
+    idx = sig.index
+    warm = min(warmup_bars(cfg), max(0, n - 2))
 
-    lows = bars["low"].astype(float)
-    last_exit_i = -10 ** 9
-    for i in range(warm, len(idx)):
-        ts = idx[i]
-        close = float(sig.at[ts, "close"])
-        if qty > 0 and cfg.stop_loss_pct > 0:
-            stop_price = entry_price * (1.0 - cfg.stop_loss_pct / 100.0)
-            if float(lows.loc[ts]) <= stop_price:
-                fill = min(stop_price, float(opens.loc[ts])) * (1.0 - cfg.slippage_pct / 100.0)
-                gross = qty * fill
-                fee = gross * cfg.fee_rate
-                krw += gross - fee
-                fees += fee
-                round_trips += 1
-                n_stop += 1
-                if fill > entry_price:
-                    wins += 1
-                if collect_rows:
-                    trades.append({"ts": ts, "side": "SELL", "reason": REASON_STOP,
-                                   "price": fill, "qty": qty, "fee_krw": fee, "krw_after": krw})
-                qty = 0.0
-                entry_price = 0.0
+    book = _Book(krw=float(init_cash))
+    trades: list[Trade] = []
+    curve: list[float] = []
+    last_exit_i = -(10 ** 9)
+
+    for i in range(warm, n):
+        if book.qty > 0 and cfg.stop_loss_pct > 0:
+            fill = _stop_fill(book.entry_price, lows[i], opens[i], cfg)
+            if fill is not None:
+                sold, fee = book.sell(fill, cfg, is_stop=True)
+                trades.append(Trade(idx[i], "SELL", REASON_STOP, fill, sold, fee, book.krw))
                 last_exit_i = i
 
-        action: Optional[str] = None
-        reason = ""
-        if qty > 0:
-            if bool(sig.at[ts, "exit"]):
-                action, reason = "SELL", REASON_EXIT
-        elif bool(sig.at[ts, "entry"]) and (i - last_exit_i) > cfg.cooldown_bars:
-            action, reason = "BUY", "entry"
-
-        if action and i + 1 < len(idx):
-            raw_px = float(opens.loc[idx[i + 1]])
-            slip = cfg.slippage_pct / 100.0
-            px = raw_px * (1.0 + slip) if action == "BUY" else raw_px * (1.0 - slip)
+        action = _decide(book.qty > 0, bool(entries[i]), bool(exits[i]),
+                         i - last_exit_i, cfg.cooldown_bars)
+        if action and i + 1 < n:
+            px = _fill_price(opens[i + 1], cfg, is_buy=action == "BUY")
             if action == "BUY":
-                budget = krw * cfg.position_pct / 100.0
-                order_krw = budget / (1.0 + cfg.fee_rate)
-                if order_krw >= cfg.min_order_krw:
-                    fee = order_krw * cfg.fee_rate
-                    qty = order_krw / px
-                    krw -= order_krw + fee
-                    fees += fee
-                    entry_price = px
-                    if collect_rows:
-                        trades.append({"ts": idx[i + 1], "side": "BUY", "reason": reason,
-                                       "price": px, "qty": qty, "fee_krw": fee, "krw_after": krw})
+                filled = book.buy(px, cfg)
+                if filled:
+                    trades.append(Trade(idx[i + 1], "BUY", REASON_BUY, px, *filled, book.krw))
             else:
-                gross = qty * px
-                fee = gross * cfg.fee_rate
-                krw += gross - fee
-                fees += fee
-                round_trips += 1
-                if px > entry_price:
-                    wins += 1
-                if reason == REASON_STOP:
-                    n_stop += 1
-                if collect_rows:
-                    trades.append({"ts": idx[i + 1], "side": "SELL", "reason": reason,
-                                   "price": px, "qty": qty, "fee_krw": fee, "krw_after": krw})
-                qty = 0.0
-                entry_price = 0.0
+                sold, fee = book.sell(px, cfg, is_stop=False)
+                trades.append(Trade(idx[i + 1], "SELL", REASON_EXIT, px, sold, fee, book.krw))
                 last_exit_i = i
-        equity.append({"ts": ts, "equity_krw": krw + qty * close})
+        curve.append(book.krw + book.qty * closes[i])
 
-    eq = pd.DataFrame(equity)
-    final = float(eq["equity_krw"].iloc[-1]) if len(eq) else init_cash
-    mdd = float(((eq["equity_krw"] / eq["equity_krw"].cummax()) - 1.0).min()) * 100.0 if len(eq) else 0.0
-    first_close = float(sig["close"].iloc[warm])
-    last_close = float(sig["close"].iloc[-1])
-    return {
-        "ret_pct": (final / init_cash - 1.0) * 100.0,
-        "final": final,
-        "mdd_pct": mdd,
-        "bh_pct": (last_close / first_close - 1.0) * 100.0,
-        "round_trips": round_trips,
-        "win_rate": (wins / round_trips * 100.0) if round_trips else 0.0,
-        "stops": n_stop,
-        "fees": fees,
-        "bars": len(eq),
-        "slippage_pct": cfg.slippage_pct,
-        "start": sig.index[warm],
-        "end": sig.index[-1],
-        "trades": trades,
-        "equity": eq,
-    }
+    eq = pd.DataFrame({"ts": idx[warm:n], "equity_krw": curve})
+    final = float(eq["equity_krw"].iloc[-1])
+    drawdown = (eq["equity_krw"] / eq["equity_krw"].cummax()) - 1.0
+    return Result(
+        ret_pct=(final / init_cash - 1.0) * 100.0,
+        final=final,
+        mdd_pct=float(drawdown.min()) * 100.0,
+        bh_pct=(float(closes[-1]) / float(closes[warm]) - 1.0) * 100.0,
+        round_trips=book.round_trips,
+        win_rate=(book.wins / book.round_trips * 100.0) if book.round_trips else 0.0,
+        stops=book.stops,
+        fees=book.fees,
+        bars=len(eq),
+        slippage_pct=cfg.slippage_pct,
+        start=idx[warm],
+        end=idx[-1],
+        equity=eq,
+        trades=trades,
+    )
 
 
 def load_bars(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise SystemExit(f"Data not found: {path}\nRun upbit_candle_fetcher.py first.")
     df = pd.read_parquet(path)
-    df.index = pd.to_datetime(df.index, utc=True)
+    df.index = pd.DatetimeIndex(pd.to_datetime(df.index, utc=True))
     return df.sort_index()
 
 
-def mod_cfg(**kw) -> Config:
-    return Config(strategy="qqe_mod", rsi_period=6, factor=3.0, **kw)
-
-
 def compare(df_1h: pd.DataFrame, init_cash: float) -> None:
-    combos = []
+    combos: list[tuple[str, str, float, Result]] = []
     for strat in ("qqe", "qqe_mod"):
         for tf in ("1h", "4h"):
-            base = mod_cfg(timeframe=tf, position_pct=100.0) if strat == "qqe_mod" \
-                else Config(strategy="qqe", timeframe=tf, position_pct=100.0)
+            base = Config(strategy=strat, timeframe=tf, position_pct=100.0)
+            if strat == "qqe_mod":
+                base = replace(base, rsi_period=MOD_RSI_PERIOD, factor=MOD_FACTOR)
             bars = resample_ohlcv(df_1h, tf)
             sig = compute_signals(bars, base)
             for sl in (0.0, 3.0, 5.0, 10.0):
-                cfg = Config(**{**base.__dict__, "stop_loss_pct": sl})
-                r = simulate(bars, sig, cfg, init_cash)
+                r = simulate(bars, sig, replace(base, stop_loss_pct=sl), init_cash)
                 combos.append((strat, tf, sl, r))
 
-    slip = combos[0][3]["slippage_pct"]
-    print(f"\n=== KRW-BTC QQE Backtest comparison (Initial {init_cash:,.0f} KRW, Allocation 100%, "
-          f"Fees 0.05%, Slippage {slip:g}%) ===")
     r0 = combos[0][3]
-    print(f"Period: {r0['start']} ~ {r0['end']}   |   Buy and hold(B&H) {r0['bh_pct']:+.2f}%\n")
+    print(f"\n=== KRW-BTC QQE Backtest comparison (Initial {init_cash:,.0f} KRW, Allocation 100%, "
+          f"Fees 0.05%, Slippage {r0.slippage_pct:g}%) ===")
+    print(f"Period: {r0.start} ~ {r0.end}   |   Buy and hold(B&H) {r0.bh_pct:+.2f}%\n")
     print(f"{'strategy':<9}{'TF':<5}{'Stop':>6}{'return':>11}{'MDD':>10}{'Trades':>7}{'Win %':>8}{'stops':>7}{'Fees':>13}")
     print("-" * 80)
     for strat, tf, sl, r in combos:
         sl_s = "None" if sl == 0 else f"{sl:g}%"
-        print(f"{strat:<9}{tf:<5}{sl_s:>6}{r['ret_pct']:>10.2f}%{r['mdd_pct']:>9.2f}%"
-              f"{r['round_trips']:>7}{r['win_rate']:>7.1f}%{r['stops']:>7}{r['fees']:>12,.0f} KRW")
-    best = max(combos, key=lambda c: c[3]["ret_pct"])
+        print(f"{strat:<9}{tf:<5}{sl_s:>6}{r.ret_pct:>10.2f}%{r.mdd_pct:>9.2f}%"
+              f"{r.round_trips:>7}{r.win_rate:>7.1f}%{r.stops:>7}{r.fees:>12,.0f} KRW")
+    best = max(combos, key=lambda c: c[3].ret_pct)
     print(f"\nBest return: {best[0]} / {best[1]} / stop loss "
-          f"{'None' if best[2] == 0 else f'{best[2]:g}%'} -> {best[3]['ret_pct']:+.2f}%")
+          f"{'None' if best[2] == 0 else f'{best[2]:g}%'} -> {best[3].ret_pct:+.2f}%")
     print("Results cover one historical period; selecting the best combination can overfit.")
 
 
 def single(df_1h: pd.DataFrame, cfg: Config, init_cash: float) -> None:
     bars = resample_ohlcv(df_1h, cfg.timeframe)
     sig = compute_signals(bars, cfg)
-    r = simulate(bars, sig, cfg, init_cash, collect_rows=True)
+    r = simulate(bars, sig, cfg, init_cash)
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    pd.DataFrame(r["trades"]).to_csv(os.path.join(OUT_DIR, "trades.csv"), index=False)
-    r["equity"].to_csv(os.path.join(OUT_DIR, "equity.csv"), index=False)
+    pd.DataFrame([asdict(t) for t in r.trades]).to_csv(
+        os.path.join(OUT_DIR, "trades.csv"), index=False)
+    r.equity.to_csv(os.path.join(OUT_DIR, "equity.csv"), index=False)
 
     print(f"\n=== {cfg.market} Backtest ===")
     print(describe(cfg))
-    print(f"\nPeriod          : {r['start']} ~ {r['end']}  ({r['bars']} bars)")
+    print(f"\nPeriod          : {r.start} ~ {r.end}  ({r.bars} bars)")
     print(f"Initial capital     : {init_cash:,.0f} KRW")
-    print(f"Final equity     : {r['final']:,.0f} KRW  ({r['ret_pct']:+.2f}%)")
-    print(f"Maximum drawdown(MDD): {r['mdd_pct']:.2f}%   |   Buy and hold(B&H): {r['bh_pct']:+.2f}%")
-    print(f"Round trips     : {r['round_trips']} trades (win rate {r['win_rate']:.1f}%, stop loss {r['stops']} trades)")
-    print(f"Total Fees   : {r['fees']:,.0f} KRW")
+    print(f"Final equity     : {r.final:,.0f} KRW  ({r.ret_pct:+.2f}%)")
+    print(f"Maximum drawdown(MDD): {r.mdd_pct:.2f}%   |   Buy and hold(B&H): {r.bh_pct:+.2f}%")
+    print(f"Round trips     : {r.round_trips} trades (win rate {r.win_rate:.1f}%, stop loss {r.stops} trades)")
+    print(f"Total Fees   : {r.fees:,.0f} KRW")
     print(f"Output          : {OUT_DIR}/trades.csv, equity.csv")
 
 

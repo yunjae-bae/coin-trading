@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -7,9 +6,16 @@ import sys
 import numpy as np
 import pandas as pd
 
-from coin_config import Config
-from coin_kernel import (compute_signals, decide_last_bar, qqe, resample_ohlcv,
-                         stop_loss_hit, warmup_bars, _rsi)
+from coin_config import MOD_FACTOR, MOD_RSI_PERIOD, Config
+from coin_kernel import (
+    _rsi,
+    compute_signals,
+    decide_last_bar,
+    qqe,
+    resample_ohlcv,
+    stop_loss_hit,
+    warmup_bars,
+)
 
 DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coin_hist_1h", "KRW-BTC.parquet")
 
@@ -22,11 +28,11 @@ def load() -> pd.DataFrame:
 
 def cfgs():
     return [Config(strategy="qqe"),
-            Config(strategy="qqe_mod", rsi_period=6, factor=3.0)]
+            Config(strategy="qqe_mod", rsi_period=MOD_RSI_PERIOD, factor=MOD_FACTOR)]
 
 
 def test_converges_on_live_timeframe(df):
-    cfg = Config(strategy="qqe_mod", rsi_period=6, factor=3.0, timeframe="6h")
+    cfg = Config(strategy="qqe_mod", rsi_period=MOD_RSI_PERIOD, factor=MOD_FACTOR, timeframe="6h")
     bars = resample_ohlcv(df, cfg.timeframe)
     need = warmup_bars(cfg)
     full = compute_signals(bars, cfg)
@@ -117,7 +123,7 @@ def test_live_matches_backtest(df):
 
 def test_resample_drops_incomplete(df):
     full4 = resample_ohlcv(df, "4h")
-    assert (full4.index.hour % 4 == 0).all(), "Four-hour bar boundaries are misaligned"
+    assert (pd.DatetimeIndex(full4.index).hour % 4 == 0).all(), "Four-hour bar boundaries are misaligned"
     last_start = full4.index[-1]
     trimmed = df[df.index < last_start + pd.Timedelta(hours=3)]
     part4 = resample_ohlcv(trimmed, "4h")

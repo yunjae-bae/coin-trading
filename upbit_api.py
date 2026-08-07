@@ -1,14 +1,14 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import UTC, datetime
+from typing import Any, Protocol
 from urllib.parse import urlencode
 
 import pandas as pd
@@ -17,6 +17,49 @@ import requests
 BASE_URL = "https://api.upbit.com"
 CANDLE_PAGE = 200
 PAGE_SLEEP = 0.15          # Pace requests within the candle-group request limit.
+
+
+class HttpResponse(Protocol):
+
+    status_code: int
+
+    @property
+    def text(self) -> str:
+        ...
+
+    def json(self) -> Any:
+        ...
+
+
+class Exchange(Protocol):
+
+    def now_utc(self) -> datetime:
+        """Exchange server time."""
+        ...
+
+    def candles_1h(self, market: str, count: int) -> pd.DataFrame:
+        """Completed hourly bars indexed by UTC opening timestamps."""
+        ...
+
+    def last_price(self, market: str) -> float | None:
+        """Return None if unavailable."""
+        ...
+
+    def balances(self, market: str) -> tuple[float, float]:
+        """Available KRW and total coin quantity, including locked coins."""
+        ...
+
+    def buy_market(self, market: str, krw: float, identifier: str) -> str:
+        """Buy by KRW amount; return the order ID or an empty string if unknown."""
+        ...
+
+    def sell_market(self, market: str, qty: float, identifier: str) -> str:
+        """Sell by coin quantity; return the order ID or an empty string if unknown."""
+        ...
+
+    def wait_done(self, identifier: str) -> tuple[str, float, float]:
+        """Return status, filled quantity and average price, including partial fills at timeout."""
+        ...
 
 
 class UpbitError(Exception):
@@ -31,7 +74,7 @@ class UpbitError(Exception):
         return f"{self}" + (f"\n     → {self.hint}" if self.hint else "")
 
 
-_ERRORS: Dict[str, Tuple[str, str]] = {
+_ERRORS: dict[str, tuple[str, str]] = {
     "no_authorization_ip": ("Request from an unregistered IP (your public IP may have changed)",
                             "Register your current IP in Upbit Open API settings."),
     "expired_access_key": ("API key expired; issue a new key",
@@ -73,11 +116,11 @@ class Upbit:
         self.access_key = access_key
         self.secret_key = secret_key
         self.timeout = timeout
-        self.server_time: Optional[datetime] = None
+        self.server_time: datetime | None = None
 
 
-    def _jwt(self, params: Optional[Dict[str, Any]] = None) -> str:
-        payload: Dict[str, Any] = {"access_key": self.access_key, "nonce": str(uuid.uuid4())}
+    def _jwt(self, params: dict[str, Any] | None = None) -> str:
+        payload: dict[str, Any] = {"access_key": self.access_key, "nonce": str(uuid.uuid4())}
         if params:
             qs = urlencode(params)          # Hash the exact query string sent to Upbit.
             payload["query_hash"] = hashlib.sha512(qs.encode()).hexdigest()
@@ -88,12 +131,10 @@ class Upbit:
                                hashlib.sha512).digest())
         return f"{header}.{body}.{sig}"
 
-    def _raise(self, r: requests.Response) -> None:
+    def _raise(self, r: HttpResponse) -> None:
         name = ""
-        try:
+        with contextlib.suppress(ValueError):
             name = str(r.json().get("error", {}).get("name") or "")
-        except ValueError:
-            pass
         if name in _ERRORS:
             desc, hint = _ERRORS[name]
             if name == "no_authorization_ip":
@@ -114,10 +155,10 @@ class Upbit:
                          f"{', ' + name if name else ''})",
                          f"Response: {r.text[:200]}", name, r.status_code)
 
-    def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None,
+    def _request(self, method: str, path: str, params: dict[str, Any] | None = None,
                  private: bool = False, retries: int = 3) -> Any:
         url = BASE_URL + path
-        last: Optional[Exception] = None
+        last: Exception | None = None
         for attempt in range(retries):
             try:
                 headers = {"Authorization": f"Bearer {self._jwt(params)}"} if private else {}
@@ -127,10 +168,9 @@ class Upbit:
                     headers["Content-Type"] = "application/json; charset=utf-8"
                     r = requests.post(url, json=params, headers=headers, timeout=self.timeout)
                 if r.headers.get("Date"):
-                    try:
-                        self.server_time = pd.to_datetime(r.headers["Date"], utc=True).to_pydatetime()
-                    except (ValueError, TypeError):
-                        pass
+                    with contextlib.suppress(ValueError, TypeError):
+                        self.server_time = pd.to_datetime(
+                            r.headers["Date"], utc=True).to_pydatetime()
                 if r.status_code >= 400:
                     self._raise(r)
                 return r.json()
@@ -140,7 +180,7 @@ class Upbit:
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 raise
-            except requests.Timeout as e:
+            except requests.Timeout:
                 last = UpbitError("Upbit request timed out", "Check your internet connection.")
                 time.sleep(1.5 * (attempt + 1))
             except requests.RequestException:
@@ -150,18 +190,17 @@ class Upbit:
         raise last if last else UpbitError("Unknown communication error")
 
     def now_utc(self) -> datetime:
-        """Exchange server time."""
-        t = self.server_time or datetime.now(timezone.utc)
-        return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+        t = self.server_time or datetime.now(UTC)
+        return t if t.tzinfo else t.replace(tzinfo=UTC)
 
 
     def candles_1h(self, market: str, count: int) -> pd.DataFrame:
         """Completed hourly bars indexed by UTC opening timestamps."""
-        frames: List[pd.DataFrame] = []
-        to: Optional[str] = None
+        frames: list[pd.DataFrame] = []
+        to: str | None = None
         got = 0
         while got < count:
-            params: Dict[str, Any] = {"market": market, "count": min(CANDLE_PAGE, count - got)}
+            params: dict[str, Any] = {"market": market, "count": min(CANDLE_PAGE, count - got)}
             if to:
                 params["to"] = to
             rows = self._request("GET", "/v1/candles/minutes/60", params)
@@ -183,15 +222,15 @@ class Upbit:
         return out[out.index + pd.Timedelta(hours=1) <= now]
 
     @staticmethod
-    def _rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    def _rows_to_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
         df = pd.DataFrame(rows)
-        df["ts"] = pd.to_datetime(df["candle_date_time_utc"], errors="coerce").dt.tz_localize(timezone.utc)
+        df["ts"] = pd.to_datetime(df["candle_date_time_utc"], errors="coerce").dt.tz_localize(UTC)
         df = df.rename(columns={"opening_price": "open", "high_price": "high", "low_price": "low",
                                 "trade_price": "close", "candle_acc_trade_volume": "volume"})
         df = df.dropna(subset=["ts"]).set_index("ts").sort_index()
         return df[["open", "high", "low", "close", "volume"]].astype(float)
 
-    def last_price(self, market: str) -> Optional[float]:
+    def last_price(self, market: str) -> float | None:
         try:
             j = self._request("GET", "/v1/ticker", {"markets": market})
             return float(j[0]["trade_price"])
@@ -199,10 +238,10 @@ class Upbit:
             return None
 
 
-    def balances(self, market: str) -> Tuple[float, float]:
+    def balances(self, market: str) -> tuple[float, float]:
         """Available KRW and total coin quantity, including locked coins."""
         coin = market.split("-")[1]
-        rows: List[Dict[str, Any]] = self._request("GET", "/v1/accounts", private=True)
+        rows: list[dict[str, Any]] = self._request("GET", "/v1/accounts", private=True)
         krw = qty = 0.0
         for r in rows:
             cur = r.get("currency")
@@ -213,23 +252,32 @@ class Upbit:
         return krw, qty
 
 
-    def order(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _order(self, params: dict[str, Any]) -> str:
+        """Return the order ID or an empty string if submission is unresolved."""
         try:
-            return self._request("POST", "/v1/orders", params, private=True, retries=2)
+            res = self._request("POST", "/v1/orders", params, private=True, retries=2)
         except UpbitError as e:
             if e.code == "duplicated_identifier":
-                return {"uuid": "", "state": "already_submitted",
-                        "identifier": params.get("identifier", "")}
+                return ""
             raise
+        return str(res.get("uuid") or "")
 
-    def order_state(self, identifier: str) -> Optional[Dict[str, Any]]:
+    def buy_market(self, market: str, krw: float, identifier: str) -> str:
+        return self._order({"market": market, "side": "bid", "ord_type": "price",
+                            "price": str(krw), "identifier": identifier})
+
+    def sell_market(self, market: str, qty: float, identifier: str) -> str:
+        return self._order({"market": market, "side": "ask", "ord_type": "market",
+                            "volume": f"{qty:.8f}", "identifier": identifier})
+
+    def order_state(self, identifier: str) -> dict[str, Any] | None:
         try:
             return self._request("GET", "/v1/order", {"identifier": identifier}, private=True,
                                  retries=2)
         except UpbitError:
             return None
 
-    def wait_done(self, identifier: str, timeout_sec: float = 30.0) -> Tuple[str, float, float]:
+    def wait_done(self, identifier: str, timeout_sec: float = 30.0) -> tuple[str, float, float]:
         """Return status, filled quantity and average price, including partial fills at timeout."""
         deadline = time.monotonic() + timeout_sec
         state, qty, avg = "unknown", 0.0, 0.0
