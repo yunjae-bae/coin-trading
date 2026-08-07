@@ -275,7 +275,14 @@ def test_run_lock(tmp):
     with open(path, "w", encoding="utf-8") as f:
         f.write("invalid contents")
     assert not lock.held_by_other(), "Broken lock prevented startup"
-    print("  [OK] Duplicate-run guard tolerates stale and corrupt locks")
+
+    lock.touch()
+    intruder = RunLock(path)
+    assert intruder.held_by_other()
+    intruder.release()
+    assert lock.held_by_other(), "Blocked instance removed the active instance lock"
+    lock.release()
+    print("  [OK] Duplicate-instance protection with stale and broken lock recovery")
 
 
 def test_stop_flag(tmp):

@@ -166,6 +166,7 @@ class RunLock:
 
     def __init__(self, path: str):
         self.path = path
+        self._owned = False
 
     def _age(self) -> float | None:
         try:
@@ -184,8 +185,11 @@ class RunLock:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 f.write(now_kst().isoformat())
+            self._owned = True
 
     def release(self) -> None:
+        if not self._owned:
+            return
         with contextlib.suppress(OSError):
             os.remove(self.path)
 

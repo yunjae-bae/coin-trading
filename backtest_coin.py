@@ -192,7 +192,7 @@ def load_bars(path: str) -> pd.DataFrame:
 def compare(df_1h: pd.DataFrame, init_cash: float) -> None:
     combos: list[tuple[str, str, float, Result]] = []
     for strat in ("qqe", "qqe_mod"):
-        for tf in ("1h", "4h"):
+        for tf in ("1h", "4h", "6h"):
             base = Config(strategy=strat, timeframe=tf, position_pct=100.0)
             if strat == "qqe_mod":
                 base = replace(base, rsi_period=MOD_RSI_PERIOD, factor=MOD_FACTOR)

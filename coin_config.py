@@ -48,7 +48,7 @@ def read_env_file(path: str = ENV_PATH) -> dict[str, tuple[str, int]]:
 class Config:
     market: str = "KRW-BTC"
     timeframe: str = "6h"
-    strategy: str = "qqe"
+    strategy: str = "qqe_mod"
     position_pct: float = 50.0
     max_order_krw: float = 0.0            # Maximum KRW per buy; zero means unlimited.
     stop_loss_pct: float = 5.0
