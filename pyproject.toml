@@ -19,6 +19,11 @@ lint = [
     "ruff>=0.16",
 ]
 
+mutate = [
+    "mutmut>=3.2",
+    "pytest>=8",
+]
+
 [tool.ruff]
 line-length = 100
 
@@ -48,3 +53,17 @@ quote-style = "double"
 [tool.basedpyright]
 typeCheckingMode = "standard"
 pythonVersion = "3.11"
+exclude = ["mutants", "**/__pycache__", ".venv"]
+
+[tool.mutmut]
+paths_to_mutate = ["coin_kernel.py"]
+tests_dir = ["test_mutation_gate.py"]
+also_copy = [
+    "autotrade_coin.py", "backtest_coin.py", "bot_state.py", "coin_config.py",
+    "fake_exchange.py", "notify.py", "upbit_api.py", "upbit_candle_fetcher.py",
+    "coin_hist_1h",
+]
+
+# Script test arguments are not pytest fixtures.
+[tool.pytest.ini_options]
+testpaths = ["test_mutation_gate.py"]
