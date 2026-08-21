@@ -24,9 +24,6 @@ mutate = [
     "pytest>=8",
 ]
 
-[tool.ruff]
-line-length = 100
-
 [tool.ruff.lint]
 select = [
     "E4", "E7", "E9", "F",
@@ -36,7 +33,7 @@ select = [
     "S",
     "PD", "NPY",
     "LOG", "G",
-    "C901", "PLR0912", "PLR0915", "PLR0913",
+    "C901", "PLR0912", "PLR0915", "PLR0913", "PLR0917",
 ]
 ignore = [
     # Formula symbols are intentional.
@@ -46,9 +43,6 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Assertions and fake credentials are intentional in tests.
 "test_*.py" = ["S101", "S106"]
-
-[tool.ruff.format]
-quote-style = "double"
 
 [tool.basedpyright]
 typeCheckingMode = "standard"
