@@ -303,7 +303,12 @@ def test_legacy_withdrawal_stop_recovers_once(tmp):
     bot.store.state.day_date = "2026-09-02"
     bot.store.state.day_start_equity = 1_000_000.0
     bot.store.save()
-    bot.stop.raise_flag("\uc624\ub298 \uc190\uc2e4\uc774 -90.00% \ub85c \uc124\uc815\ud55c \uc77c\uc77c \uc190\uc2e4 \ud55c\ub3c4\ub97c \ub118\uc5c8\uc2b5\ub2c8\ub2e4")
+    bot.store.state.cashflow_tracking_version = 1
+    bot.store.save()
+    bot.stop.raise_flag(
+        "\uc624\ub298 \uc190\uc2e4\uc774 -39.98% \ub85c \uc124\uc815\ud55c \ud55c\ub3c4(10%)\ub97c \ub118\uc5c8\uc2b5\ub2c8\ub2e4.\n"
+        "\uc624\ub298 \uc2dc\uc791 \uc790\uc0b0 4,999,982\uc6d0 \u2192 \ud604\uc7ac 3,000,982\uc6d0"
+    )
 
     assert bot._upgrade_cashflow_tracking() is True
     assert not bot.stop.active

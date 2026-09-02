@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 KST = timezone(timedelta(hours=9))
-CASHFLOW_TRACKING_VERSION = 1
+CASHFLOW_TRACKING_VERSION = 2
 
 
 def now_kst() -> datetime:

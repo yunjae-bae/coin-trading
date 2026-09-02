@@ -476,7 +476,10 @@ class Bot:
         recovered = False
         if self.stop.active:
             reason = self.stop.reason()
-            if "\uc77c\uc77c \uc190\uc2e4" in reason and "\ud55c\ub3c4" in reason:
+            is_daily_loss_stop = (
+                ("\ud55c\ub3c4" in reason and ("\uc624\ub298 \uc190\uc2e4" in reason or "\uc77c\uc77c \uc190\uc2e4" in reason)) or ("daily loss" in reason.lower() and "limit" in reason.lower())
+            )
+            if is_daily_loss_stop:
                 self.stop.clear()
                 st.day_date = ""
                 st.day_start_equity = 0.0
