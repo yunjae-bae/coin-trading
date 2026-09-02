@@ -47,7 +47,7 @@ ignore = [
 [tool.basedpyright]
 typeCheckingMode = "standard"
 pythonVersion = "3.11"
-exclude = ["mutants", "**/__pycache__", ".venv"]
+exclude = ["mutants", "analysis", "**/__pycache__", ".venv"]
 
 [tool.mutmut]
 paths_to_mutate = ["coin_kernel.py"]

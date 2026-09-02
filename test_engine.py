@@ -7,7 +7,7 @@ import sys
 import tempfile
 from datetime import UTC
 
-from bot_state import Position, StateStore, StopFlag
+from bot_state import CASHFLOW_TRACKING_VERSION, Position, StateStore, StopFlag
 from coin_config import ConfigError, load_config
 
 
@@ -253,6 +253,69 @@ def test_daily_loss(tmp):
     print("  [OK] Daily loss calculation")
 
 
+def test_external_cashflow_is_not_profit_or_loss(tmp):
+    store = StateStore(os.path.join(tmp, "cashflow.json"))
+    store.state.day_start_equity = 1_000_000.0
+    assert store.observe_account(1_000_000.0, 0.0, 100_000.0) == 0.0
+
+    withdrawn = store.observe_account(100_000.0, 0.0, 100_000.0)
+    assert withdrawn == -900_000.0
+    assert store.state.day_start_equity == 100_000.0
+    assert abs(store.day_loss_pct(100_000.0)) < 1e-9, "Withdrawal counted as a 90% loss"
+
+    deposited = store.observe_account(400_000.0, 0.0, 100_000.0)
+    assert deposited == 300_000.0
+    assert store.state.day_start_equity == 400_000.0
+    assert abs(store.day_loss_pct(400_000.0)) < 1e-9, "Deposit counted as profit"
+
+    held = StateStore(os.path.join(tmp, "held.json"))
+    held.state.day_start_equity = 1_000_000.0
+    held.observe_account(0.0, 1.0, 1_000_000.0)
+    assert held.observe_account(0.0, 1.0, 900_000.0) == 0.0
+    assert abs(held.day_loss_pct(900_000.0) - (-10.0)) < 1e-9, \
+        "Market loss was hidden as a withdrawal"
+
+    # Cash flow after a loss must neither dilute nor inflate the loss percentage.
+    after_loss = held.observe_account(500_000.0, 0.0, 900_000.0)
+    assert after_loss == -400_000.0
+    assert abs(held.day_loss_pct(500_000.0) - (-10.0)) < 1e-9, \
+        "Withdrawal changed an existing loss percentage"
+    after_deposit = held.observe_account(800_000.0, 0.0, 900_000.0)
+    assert after_deposit == 300_000.0
+    assert abs(held.day_loss_pct(800_000.0) - (-10.0)) < 1e-9, \
+        "Deposit diluted an existing loss percentage"
+
+    manual = StateStore(os.path.join(tmp, "manual.json"))
+    manual.state.day_start_equity = 1_000_000.0
+    manual.observe_account(0.0, 1.0, 900_000.0)
+    assert manual.observe_account(900_000.0, 0.0, 900_000.0) == 0.0
+    print("  [OK] Exclude external cash flow while preserving market profit/loss")
+
+
+def test_legacy_withdrawal_stop_recovers_once(tmp):
+    from autotrade_coin import Bot
+    from coin_config import Config
+
+    bot = Bot(Config())
+    bot.store = StateStore(os.path.join(tmp, "legacy.json"))
+    bot.stop = StopFlag(os.path.join(tmp, "legacy-stop.txt"))
+    bot.store.state.cashflow_tracking_version = 0
+    bot.store.state.day_date = "2026-09-02"
+    bot.store.state.day_start_equity = 1_000_000.0
+    bot.store.save()
+    bot.stop.raise_flag("\uc624\ub298 \uc190\uc2e4\uc774 -90.00% \ub85c \uc124\uc815\ud55c \uc77c\uc77c \uc190\uc2e4 \ud55c\ub3c4\ub97c \ub118\uc5c8\uc2b5\ub2c8\ub2e4")
+
+    assert bot._upgrade_cashflow_tracking() is True
+    assert not bot.stop.active
+    assert bot.store.state.day_date == "" and bot.store.state.day_start_equity == 0.0
+    assert bot.store.state.cashflow_tracking_version == CASHFLOW_TRACKING_VERSION
+
+    bot.stop.raise_flag("Daily loss -12.00% exceeds the daily loss limit")
+    assert bot._upgrade_cashflow_tracking() is False
+    assert bot.stop.active, "Current-version daily loss stop was incorrectly cleared"
+    print("  [OK] One-time legacy stop recovery preserves subsequent loss stops")
+
+
 def test_run_lock(tmp):
     from datetime import timedelta
 
@@ -310,6 +373,8 @@ def main() -> int:
         test_identifier()
         test_next_bar_close()
         test_daily_loss(tmp)
+        test_external_cashflow_is_not_profit_or_loss(tmp)
+        test_legacy_withdrawal_stop_recovers_once(tmp)
         test_run_lock(tmp)
         test_stop_flag(tmp)
         print("\nAll checks passed")

@@ -10,7 +10,15 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 
 import notify
-from bot_state import KST, RunLock, StateStore, StopFlag, fmt, now_kst
+from bot_state import (
+    CASHFLOW_TRACKING_VERSION,
+    KST,
+    RunLock,
+    StateStore,
+    StopFlag,
+    fmt,
+    now_kst,
+)
 from coin_config import BASE_DIR, ENV_PATH, Config, ConfigError, describe, load_config
 from coin_kernel import (
     REASON_STOP,
@@ -296,8 +304,15 @@ class Bot:
         # Use the latest close if the price request fails; entry price would hide losses.
         mark = price or close
         equity = krw + pos.qty * mark
-        if self.store.roll_day(equity):
+        new_day = self.store.roll_day(equity)
+        if new_day:
             log(f"  Starting daily reference equity: {equity:,.0f} KRW")
+        external_flow = self.store.observe_account(
+            krw, pos.qty, mark, adjust_day_base=not new_day)
+        if external_flow:
+            direction = "deposit" if external_flow > 0 else "withdrawal"
+            log(f"  External cash flow: {direction}of approximately {abs(external_flow):,.0f} KRW detected; "
+                f"excluded from daily profit/loss")
         self._halt_on_daily_loss(equity, mark, krw)
 
         action, reason = self._decide(bars)
@@ -453,6 +468,29 @@ class Bot:
             return True
         return False
 
+    def _upgrade_cashflow_tracking(self) -> bool:
+        st = self.store.state
+        if st.cashflow_tracking_version >= CASHFLOW_TRACKING_VERSION:
+            return False
+
+        recovered = False
+        if self.stop.active:
+            reason = self.stop.reason()
+            if "\uc77c\uc77c \uc190\uc2e4" in reason and "\ud55c\ub3c4" in reason:
+                self.stop.clear()
+                st.day_date = ""
+                st.day_start_equity = 0.0
+                recovered = True
+        st.cashflow_tracking_version = CASHFLOW_TRACKING_VERSION
+        st.account_observed = False
+        st.observed_krw = 0.0
+        st.observed_position_qty = 0.0
+        self.store.save()
+        if recovered:
+            log("  Cleared a legacy stop caused by treating a withdrawal as a loss. "
+                "Using current balances as the new reference")
+        return recovered
+
     def _greet(self) -> None:
         log(f"■ Start\n{describe(self.cfg)}")
         if not os.path.exists(ENV_PATH):
@@ -479,7 +517,12 @@ class Bot:
             self.cycle()
             self.last_error = ""
             self.fail_streak = 0
-            return self.api.last_price(self.cfg.market), self.read_account()[0]
+            price = self.api.last_price(self.cfg.market)
+            krw, _ = self.read_account()
+            # Refresh observations after successful orders so later price changes
+            # are not mistaken for deposits or withdrawals.
+            self.store.record_account(krw, self.store.state.position.qty)
+            return price, krw
         except SystemExit:
             raise
         except ConfigError as e:
@@ -527,6 +570,7 @@ class Bot:
         warn = self.store.load()
         if warn:
             log(f"⚠ {warn}")
+        self._upgrade_cashflow_tracking()
         if self._blocked():
             return
         self.lock.touch()

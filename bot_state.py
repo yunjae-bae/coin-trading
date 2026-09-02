@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 KST = timezone(timedelta(hours=9))
+CASHFLOW_TRACKING_VERSION = 1
 
 
 def now_kst() -> datetime:
@@ -42,6 +43,10 @@ class State:
     last_error: str = ""
     orphan_notified: str = ""
     heartbeat_date: str = ""         # KST date of the last heartbeat.
+    cashflow_tracking_version: int = CASHFLOW_TRACKING_VERSION
+    account_observed: bool = False
+    observed_krw: float = 0.0
+    observed_position_qty: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -51,6 +56,8 @@ class State:
         pos = Position(**{k: v for k, v in (d.get("position") or {}).items()
                           if k in Position.__dataclass_fields__})
         rest = {k: v for k, v in d.items() if k in cls.__dataclass_fields__ and k != "position"}
+        # A missing version field denotes state predating cash-flow tracking.
+        rest["cashflow_tracking_version"] = int(d.get("cashflow_tracking_version") or 0)
         return cls(position=pos, **rest)
 
 
@@ -159,6 +166,37 @@ class StateStore:
         if base <= 0:
             return 0.0
         return (equity / base - 1.0) * 100.0
+
+    def observe_account(self, krw: float, position_qty: float, mark: float,
+                        *, adjust_day_base: bool = True) -> float:
+        """Return external cash flow above tolerance; adjust the daily equity reference if enabled."""
+        st = self.state
+        if not st.account_observed:
+            self.record_account(krw, position_qty)
+            return 0.0
+
+        expected = st.observed_krw + st.observed_position_qty * mark
+        current = krw + position_qty * mark
+        external_flow = current - expected
+        tolerance = max(5_000.0, abs(expected) * 0.005)
+        adjusted = external_flow if adjust_day_base and abs(external_flow) > tolerance else 0.0
+        if adjusted:
+            # Adjust the reference proportionally to preserve the existing return percentage.
+            if expected > 0 and st.day_start_equity > 0:
+                st.day_start_equity = max(0.0, st.day_start_equity * current / expected)
+            else:
+                st.day_start_equity = max(0.0, current)
+        st.observed_krw = krw
+        st.observed_position_qty = position_qty
+        self.save()
+        return adjusted
+
+    def record_account(self, krw: float, position_qty: float) -> None:
+        st = self.state
+        st.account_observed = True
+        st.observed_krw = krw
+        st.observed_position_qty = position_qty
+        self.save()
 
 
 class RunLock:
