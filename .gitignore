@@ -16,3 +16,11 @@ out/
 # Generated mutation-testing source copies.
 mutants/
 .mutmut-cache
+
+# Local datasets, personal analysis, and operator documents
+coin_hist_1h/
+analysis/
+DECISIONS.md
+/[1-6]-*.bat
+/*.txt
+!requirements.txt
