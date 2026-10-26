@@ -45,8 +45,8 @@ class PendingOrder:
 class State:
     market: str = ""
     position: Position = field(default_factory=Position)
-    pending_exit: bool = False
     # Partial fills still need an exit when the original signal has passed.
+    pending_exit: bool = False
     last_bar_attempted: str = ""
     day_date: str = ""               # KST date for the daily loss reference.
     day_start_equity: float = 0.0

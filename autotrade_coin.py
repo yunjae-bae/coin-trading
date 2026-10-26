@@ -209,7 +209,7 @@ class Bot:
             raise ConfigError("Resolve the pending order before changing MARKET.")
         state, filled, average = self.api.wait_done(pending.identifier)
         if state not in ("wait", "watch", "done", "cancel"):
-            log(f"Order {pending.identifier} remains unresolved.")
+            log(f"Order {pending.identifier} remains unresolved; no new orders will be submitted.")
             return False
         if (not math.isfinite(filled) or not math.isfinite(average)
                 or filled < pending.filled_qty or (filled > 0 and average <= 0)):
@@ -542,7 +542,7 @@ class Bot:
         st.observed_position_qty = 0.0
         self.store.save()
         if self.stop.active:
-            log("Legacy halt retained.")
+            log("Legacy halt retained. Review the account before manually removing the stop file.")
 
     def _greet(self) -> None:
         log(f"■ Start\n{describe(self.cfg)}")
