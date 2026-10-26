@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import sys
+import tempfile
+from contextlib import redirect_stdout
 from dataclasses import replace
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
-from backtest_coin import REASON_BUY, simulate
-from coin_config import Config
+import backtest_coin
+from backtest_coin import REASON_BUY, compare, simulate
+from coin_config import Config, load_config
 from coin_kernel import REASON_EXIT, REASON_STOP, warmup_bars
 
 N = 610          # Exceed the 600-bar warmup floor so the final ten bars are simulated.
@@ -69,6 +75,48 @@ def test_fee_and_slippage():
     print("  [OK] Fees and adverse slippage on both sides")
 
 
+def test_equity_excludes_future_fills():
+    bars, sig = _frames(entries=[WARM + 2], exits=[])
+    bars.iloc[WARM + 3:, :4] = 200.0
+    sig.loc[bars.index[WARM + 3:], "close"] = 200.0
+    r = simulate(bars, sig, _cfg(), 1_000_000.0)
+    assert (r.equity["equity_krw"] == 1_000_000.0).all(), \
+        "A future gap changed equity before the buy executed"
+    assert r.mdd_pct == 0.0, f"A lossless trade produced drawdown: {r.mdd_pct}"
+
+    bars, sig = _frames(entries=[WARM], exits=[WARM + 3], opens={WARM + 4: 130.0})
+    r = simulate(bars, sig, _cfg(), 1_000_000.0)
+    assert r.equity["equity_krw"].iloc[3] == 1_000_000.0, "Future sell proceeds changed earlier equity"
+    assert r.equity["equity_krw"].iloc[4] == 1_300_000.0
+    print("  [OK] Equity changes only when orders execute")
+
+
+def test_entry_bar_stop_and_exit_precedence():
+    bars, sig = _frames(entries=[WARM], exits=[], lows={WARM + 1: 89.0})
+    r = simulate(bars, sig, _cfg(stop_loss_pct=10.0), 1_000_000.0)
+    buy, stop = r.trades
+    assert buy.ts == stop.ts == bars.index[WARM + 1]
+    assert stop.price == 90.0 and stop.reason == REASON_STOP
+    assert r.equity["equity_krw"].iloc[0] == 1_000_000.0
+    assert r.equity["equity_krw"].iloc[1] == 900_000.0
+
+    bars, sig = _frames(entries=[WARM], exits=[WARM + 1],
+                        opens={WARM + 2: 105.0}, lows={WARM + 2: 50.0})
+    r = simulate(bars, sig, _cfg(stop_loss_pct=10.0), 1_000_000.0)
+    assert r.trades[1].reason == REASON_EXIT and r.trades[1].price == 105.0
+    assert r.stops == 0, "An intrabar low overrode an already executed open exit"
+    print("  [OK] Entry-bar stops and next-open exit precedence")
+
+
+def test_order_cap_includes_fees():
+    bars, sig = _frames(entries=[WARM], exits=[])
+    r = simulate(bars, sig, _cfg(max_order_krw=200_000.0, fee_rate=0.001), 1_000_000.0)
+    buy = r.trades[0]
+    assert abs(buy.price * buy.qty + buy.fee_krw - 200_000.0) < 1e-6
+    assert abs(buy.krw_after - 800_000.0) < 1e-6
+    print("  [OK] Maximum buy allocation includes fees")
+
+
 def test_stop_inside_bar():
     bars, sig = _frames(entries=[WARM], exits=[], lows={WARM + 2: 89.0})
     r = simulate(bars, sig, _cfg(stop_loss_pct=10.0), 1_000_000.0)
@@ -88,6 +136,7 @@ def test_stop_gap_fills_at_open():
 
 def test_cooldown_blocks_reentry():
     bars, sig = _frames(entries=[WARM, WARM + 2, WARM + 5], exits=[WARM + 1])
+    # Exit fills at WARM+2; zero cooldown permits a new signal at that bar's close.
     held = simulate(bars, sig, _cfg(cooldown_bars=2), 1_000_000.0)
     free = simulate(bars, sig, _cfg(cooldown_bars=0), 1_000_000.0)
     assert len(held.trades) == 3 and len(free.trades) == 3
@@ -96,7 +145,57 @@ def test_cooldown_blocks_reentry():
         f"Reentered after one bar despite a two-bar cooldown: {held.trades[2].ts}"
     assert free.trades[2].ts == bars.index[WARM + 3], \
         f"Entry delayed despite zero cooldown: {free.trades[2].ts}"
+
+    bars, sig = _frames(entries=[WARM, WARM + 3, WARM + 4], exits=[WARM + 1])
+    boundary = simulate(bars, sig, _cfg(cooldown_bars=1), 1_000_000.0)
+    assert boundary.trades[2].ts == bars.index[WARM + 5], "Cooldown counted from signal rather than exit fill"
     print("  [OK] Cooldown blocks reentry")
+
+
+def test_final_signal_does_not_execute():
+    bars, sig = _frames(entries=[N - 1], exits=[])
+    r = simulate(bars, sig, _cfg(), 1_000_000.0)
+    assert r.trades == [] and r.final == 1_000_000.0
+    print("  [OK] Final close cannot execute without a next open")
+
+
+def test_strategy_defaults():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "settings.env"
+        missing = load_config(str(path))
+        assert (missing.strategy, missing.rsi_period, missing.factor) == ("qqe_mod", 6, 3.0)
+        for strategy, period, factor in [("qqe", 14, 4.238), ("qqe_mod", 6, 3.0)]:
+            direct = Config(strategy=strategy)
+            path.write_text(f"STRATEGY={strategy}\nQQE_RSI_PERIOD=\nQQE_FACTOR=\n", encoding="utf-8")
+            loaded = load_config(str(path))
+            assert (direct.rsi_period, direct.factor) == (loaded.rsi_period, loaded.factor) == (period, factor)
+        path.write_text("STRATEGY=qqe_mod\nQQE_RSI_PERIOD=14\nQQE_FACTOR=4.238\n", encoding="utf-8")
+        explicit = load_config(str(path))
+        assert (explicit.rsi_period, explicit.factor) == (14, 4.238), "Explicit strategy parameters were replaced"
+        path.write_text("STRATEGY=\n", encoding="utf-8")
+        assert load_config(str(path)).strategy == Config().strategy
+    print("  [OK] Missing, empty, and explicit strategy defaults")
+
+
+def test_comparison_uses_common_period():
+    idx = pd.date_range("2026-01-01", periods=4001, freq="h", tz="UTC")
+    prices = np.linspace(100.0, 200.0, len(idx))
+    bars = pd.DataFrame(dict(open=prices, high=prices, low=prices,
+                             close=prices, volume=np.ones(len(idx))), index=idx)
+    results = []
+
+    def record(bars, sig, cfg, init_cash, *, start=None):
+        result = simulate(bars, sig, cfg, init_cash, start=start)
+        results.append((cfg, result))
+        return result
+
+    with patch.object(backtest_coin, "simulate", side_effect=record), redirect_stdout(StringIO()):
+        compare(bars, 1_000_000.0)
+    assert len(results) == 24
+    assert len({result.start for _, result in results}) == 1, "Compared unequal warmup periods"
+    assert len({result.end + pd.Timedelta(hours=cfg.bar_hours) for cfg, result in results}) == 1, \
+        "Compared different final close times"
+    print("  [OK] Comparison configurations share evaluation boundaries")
 
 
 def test_min_order_krw_skips_buy():
@@ -121,9 +220,15 @@ def main() -> int:
     test_warm_window()
     test_fills_at_next_bar_open()
     test_fee_and_slippage()
+    test_equity_excludes_future_fills()
+    test_entry_bar_stop_and_exit_precedence()
+    test_order_cap_includes_fees()
     test_stop_inside_bar()
     test_stop_gap_fills_at_open()
     test_cooldown_blocks_reentry()
+    test_final_signal_does_not_execute()
+    test_strategy_defaults()
+    test_comparison_uses_common_period()
     test_min_order_krw_skips_buy()
     test_index_mismatch_raises()
     print("\nAll checks passed")

@@ -6,7 +6,7 @@ import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, TextIO
 
 KST = timezone(timedelta(hours=9))
 CASHFLOW_TRACKING_VERSION = 2
@@ -32,7 +32,18 @@ class Position:
 
 
 @dataclass
+class PendingOrder:
+    identifier: str
+    side: str
+    market: str
+    position_qty: float
+    reason: str
+    filled_qty: float = 0.0
+
+
+@dataclass
 class State:
+    market: str = ""
     position: Position = field(default_factory=Position)
     pending_exit: bool = False
     # Partial fills still need an exit when the original signal has passed.
@@ -47,6 +58,10 @@ class State:
     account_observed: bool = False
     observed_krw: float = 0.0
     observed_position_qty: float = 0.0
+    pending_order: PendingOrder | None = None
+    paper_krw: float = 10_000_000.0
+    order_sequence: int = 0
+    last_exit_time: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -55,10 +70,12 @@ class State:
     def from_json(cls, d: dict[str, Any]) -> State:
         pos = Position(**{k: v for k, v in (d.get("position") or {}).items()
                           if k in Position.__dataclass_fields__})
-        rest = {k: v for k, v in d.items() if k in cls.__dataclass_fields__ and k != "position"}
+        rest = {k: v for k, v in d.items()
+                if k in cls.__dataclass_fields__ and k not in ("position", "pending_order")}
+        pending = PendingOrder(**d["pending_order"]) if d.get("pending_order") else None
         # A missing version field denotes state predating cash-flow tracking.
         rest["cashflow_tracking_version"] = int(d.get("cashflow_tracking_version") or 0)
-        return cls(position=pos, **rest)
+        return cls(position=pos, pending_order=pending, **rest)
 
 
 class StateStore:
@@ -204,32 +221,56 @@ class RunLock:
 
     def __init__(self, path: str):
         self.path = path
-        self._owned = False
+        self._file: TextIO | None = None
 
-    def _age(self) -> float | None:
+    def acquire(self) -> bool:
+        if self._file is not None:
+            return True
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        # The file must remain open after acquire returns to hold the process lock.
+        handle = open(self.path, "a+", encoding="utf-8")  # noqa: SIM115
         try:
-            with open(self.path, encoding="utf-8") as f:
-                t = datetime.fromisoformat(f.read().strip())
-            return (now_kst() - t).total_seconds()
-        except (OSError, ValueError):
-            return None
+            self._lock(handle)
+        except OSError:
+            handle.close()
+            return False
+        self._file = handle
+        # An older bot only writes timestamps; respect its recent heartbeat.
+        handle.seek(0)
+        previous = handle.read().strip()
+        try:
+            age = (now_kst() - datetime.fromisoformat(previous)).total_seconds()
+        except (ValueError, TypeError):
+            age = self.STALE_SEC
+        if age < self.STALE_SEC:
+            self.release()
+            return False
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"pid:{os.getpid()}\n")
+            handle.flush()
+        except OSError:
+            self.release()
+            raise
+        return True
 
-    def held_by_other(self) -> bool:
-        age = self._age()
-        return age is not None and 0 <= age < self.STALE_SEC
-
-    def touch(self) -> None:
-        with contextlib.suppress(OSError):
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                f.write(now_kst().isoformat())
-            self._owned = True
+    @staticmethod
+    def _lock(handle: TextIO) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def release(self) -> None:
-        if not self._owned:
+        if self._file is None:
             return
-        with contextlib.suppress(OSError):
-            os.remove(self.path)
+        # Keep the inode: unlinking a locked file permits a second lock file.
+        self._file.close()
+        self._file = None
 
 
 class StopFlag:

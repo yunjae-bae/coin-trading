@@ -13,6 +13,7 @@ class Order:
     side: str
     amount: float          # KRW for buys; coin quantity for sells.
     identifier: str
+    executed_qty: float = 0.0
 
 
 @dataclass
@@ -48,7 +49,7 @@ class FakeExchange:
 
 
     def buy_market(self, market: str, krw: float, identifier: str) -> str:
-        self.orders.append(Order("bid", krw, identifier))
+        self.orders.append(Order("bid", krw, identifier, self.fill_qty))
         self.coin += self.fill_qty
         self.krw -= krw
         return f"uuid-{len(self.orders)}"
@@ -56,9 +57,16 @@ class FakeExchange:
     def sell_market(self, market: str, qty: float, identifier: str) -> str:
         if self.reject_sell_code:
             raise UpbitError("Exchange rejected the sell order", "", self.reject_sell_code, 400)
-        self.orders.append(Order("ask", qty, identifier))
-        self.coin = self.remain_after_sell if self.remain_after_sell is not None else 0.0
+        remaining = self.remain_after_sell if self.remain_after_sell is not None else max(0.0, self.coin - qty)
+        executed = self.coin - remaining
+        self.orders.append(Order("ask", qty, identifier, executed))
+        self.coin = remaining
+        self.krw += executed * (self.fill_avg or self.price or 0.0)
         return f"uuid-{len(self.orders)}"
 
     def wait_done(self, identifier: str) -> tuple[str, float, float]:
-        return self.fill_state, self.fill_qty, self.fill_avg
+        order = next((order for order in self.orders if order.identifier == identifier), None)
+        if order is None:
+            return "unknown", 0.0, 0.0
+        qty = order.executed_qty
+        return self.fill_state, qty, (self.fill_avg or self.price or 0.0) if qty else 0.0

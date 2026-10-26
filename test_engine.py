@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import shutil
 import sys
@@ -292,65 +293,102 @@ def test_external_cashflow_is_not_profit_or_loss(tmp):
     print("  [OK] Exclude external cash flow while preserving market profit/loss")
 
 
-def test_legacy_withdrawal_stop_recovers_once(tmp):
+def test_migration_preserves_halts(tmp):
     from autotrade_coin import Bot
     from coin_config import Config
+    from fake_exchange import FakeExchange
 
-    bot = Bot(Config())
+    bot = Bot(Config(), FakeExchange())
     bot.store = StateStore(os.path.join(tmp, "legacy.json"))
     bot.stop = StopFlag(os.path.join(tmp, "legacy-stop.txt"))
-    bot.store.state.cashflow_tracking_version = 0
+    bot.store.state.cashflow_tracking_version = 1
     bot.store.state.day_date = "2026-09-02"
     bot.store.state.day_start_equity = 1_000_000.0
-    bot.store.save()
-    bot.store.state.cashflow_tracking_version = 1
-    bot.store.save()
-    bot.stop.raise_flag(
-        "\uc624\ub298 \uc190\uc2e4\uc774 -39.98% \ub85c \uc124\uc815\ud55c \ud55c\ub3c4(10%)\ub97c \ub118\uc5c8\uc2b5\ub2c8\ub2e4.\n"
-        "\uc624\ub298 \uc2dc\uc791 \uc790\uc0b0 4,999,982\uc6d0 \u2192 \ud604\uc7ac 3,000,982\uc6d0"
-    )
-
-    assert bot._upgrade_cashflow_tracking() is True
-    assert not bot.stop.active
-    assert bot.store.state.day_date == "" and bot.store.state.day_start_equity == 0.0
+    bot.stop.raise_flag("\uc624\ub298 \uc190\uc2e4\uc774 -12% \ud55c\ub3c4 \ucd08\uacfc")
+    bot._upgrade_cashflow_tracking()
+    assert bot.stop.active, "Migration cleared a potentially genuine loss halt"
+    assert bot.store.state.day_start_equity == 1_000_000.0
     assert bot.store.state.cashflow_tracking_version == CASHFLOW_TRACKING_VERSION
-
     bot.stop.raise_flag("Daily loss -12.00% exceeds the daily loss limit")
-    assert bot._upgrade_cashflow_tracking() is False
-    assert bot.stop.active, "Current-version daily loss stop was incorrectly cleared"
-    print("  [OK] One-time legacy stop recovery preserves subsequent loss stops")
+    bot._upgrade_cashflow_tracking()
+    assert bot.stop.active
+    print("  [OK] Migration preserves legacy and current loss halts for operator review")
+
+
+def _lock_process(path, start, release, results):
+    from bot_state import RunLock
+    lock = RunLock(path)
+    start.wait(10)
+    acquired = lock.acquire()
+    results.put(acquired)
+    if acquired:
+        release.wait(10)
+    lock.release()
 
 
 def test_run_lock(tmp):
-    from datetime import timedelta
-
-    from bot_state import RunLock, now_kst
-    path = os.path.join(tmp, "\uc2e4\ud589\uc911.lock")
+    from bot_state import RunLock
+    path = os.path.join(tmp, "runtime.lock")
+    ctx = multiprocessing.get_context("spawn")
+    start, release, results = ctx.Event(), ctx.Event(), ctx.Queue()
+    workers = [ctx.Process(target=_lock_process, args=(path, start, release, results)) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    start.set()
+    try:
+        assert sorted([results.get(timeout=10), results.get(timeout=10)]) == [False, True]
+        intruder = RunLock(path)
+        assert not intruder.acquire()
+        intruder.release()
+        assert not intruder.acquire(), "Rejected process released another process's lock"
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(10)
+            if worker.is_alive():
+                worker.terminate()
+                worker.join()
+        results.close()
     lock = RunLock(path)
-
-    assert not lock.held_by_other(), "Nonexistent lock reported as active"
-    lock.touch()
-    assert lock.held_by_other(), "Fresh lock not detected; duplicate instance allowed"
+    assert lock.acquire(), "Released OS lock prevented restart"
     lock.release()
-    assert not lock.held_by_other(), "Lock remained after release"
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write((now_kst() - timedelta(seconds=RunLock.STALE_SEC + 10)).isoformat())
-    assert not lock.held_by_other(), "Stale lock prevented restart"
+    start, release, results = ctx.Event(), ctx.Event(), ctx.Queue()
+    worker = ctx.Process(target=_lock_process, args=(path, start, release, results))
+    worker.start()
+    start.set()
+    try:
+        assert results.get(timeout=10)
+        worker.terminate()
+        worker.join(10)
+        assert lock.acquire(), "Process termination did not release the OS lock"
+        lock.release()
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+        worker.join()
+        results.close()
+    print("  [OK] Exclusive process lock, rejected cleanup, and crash recovery")
 
-    assert RunLock.STALE_SEC < 180, "Lock timeout exceeds restart delay and prevents recovery"
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("invalid contents")
-    assert not lock.held_by_other(), "Broken lock prevented startup"
-
-    lock.touch()
-    intruder = RunLock(path)
-    assert intruder.held_by_other()
-    intruder.release()
-    assert lock.held_by_other(), "Blocked instance removed the active instance lock"
-    lock.release()
-    print("  [OK] Duplicate-instance protection with stale and broken lock recovery")
+def test_lock_precedes_state_loading(tmp):
+    from autotrade_coin import Bot
+    from bot_state import RunLock
+    from coin_config import Config
+    from fake_exchange import FakeExchange
+    lock = RunLock(os.path.join(tmp, "before-load.lock"))
+    assert lock.acquire()
+    bot = Bot(Config(), FakeExchange())
+    bot.lock = RunLock(lock.path)
+    def forbidden_load():
+        raise AssertionError("Blocked instance loaded or migrated shared state")
+    bot.store.load = forbidden_load
+    try:
+        bot.run(once=True)
+    finally:
+        bot.lock.release()
+        lock.release()
+    print("  [OK] Lock acquired before shared state loading or migration")
 
 
 def test_stop_flag(tmp):
@@ -367,6 +405,10 @@ def test_stop_flag(tmp):
 
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="coinbot-test-")
+    import autotrade_coin
+    autotrade_coin.OUT_DIR = tmp
+    autotrade_coin.LOG_PATH = os.path.join(tmp, "trading.log")
+    autotrade_coin.STATUS_PATH = os.path.join(tmp, "status.txt")
     try:
         test_corrupted_state_recovers(tmp)
         test_backup_recovery(tmp)
@@ -379,8 +421,9 @@ def main() -> int:
         test_next_bar_close()
         test_daily_loss(tmp)
         test_external_cashflow_is_not_profit_or_loss(tmp)
-        test_legacy_withdrawal_stop_recovers_once(tmp)
+        test_migration_preserves_halts(tmp)
         test_run_lock(tmp)
+        test_lock_precedes_state_loading(tmp)
         test_stop_flag(tmp)
         print("\nAll checks passed")
         return 0

@@ -8,10 +8,12 @@ ENV_PATH = os.path.join(BASE_DIR, ".env")
 
 TIMEFRAMES = ("1h", "2h", "3h", "4h", "6h", "8h", "12h", "1d")
 STRATEGIES = ("qqe", "qqe_mod")
+DEFAULT_STRATEGY = "qqe_mod"
 
 # QQE MOD uses different first-QQE defaults from standard QQE (Mihkel00).
 MOD_RSI_PERIOD = 6
 MOD_FACTOR = 3.0
+STRATEGY_DEFAULTS = {"qqe": (14, 4.238), "qqe_mod": (MOD_RSI_PERIOD, MOD_FACTOR)}
 
 
 class ConfigError(Exception):
@@ -48,12 +50,12 @@ def read_env_file(path: str = ENV_PATH) -> dict[str, tuple[str, int]]:
 class Config:
     market: str = "KRW-BTC"
     timeframe: str = "6h"
-    strategy: str = "qqe_mod"
+    strategy: str = DEFAULT_STRATEGY
     position_pct: float = 50.0
     max_order_krw: float = 0.0            # Maximum KRW per buy; zero means unlimited.
-    stop_loss_pct: float = 5.0
-    daily_loss_limit_pct: float = 10.0
-    cooldown_bars: int = 0
+    stop_loss_pct: float = 5.0            # Zero disables this limit.
+    daily_loss_limit_pct: float = 10.0    # Zero disables this limit.
+    cooldown_bars: int = 0                # Block entry signals through exit bar + N; zero disables cooldown.
     price_guard_pct: float = 5.0          # Defer buys this far from the signal close; zero disables the guard.
     signal_max_age_min: float = 60.0
     # Zero disables the entry-age check.
@@ -66,9 +68,10 @@ class Config:
     fee_rate: float = 0.0005
     min_order_krw: float = 5000.0
     slippage_pct: float = 0.05    # Backtest-only adverse execution slippage.
-    rsi_period: int = 14
+    # Negative sentinels resolve omitted settings from the selected strategy.
+    rsi_period: int = -1
     sf: int = 5
-    factor: float = 4.238
+    factor: float = -1.0
     rsi_period2: int = 6
     sf2: int = 5
     factor2: float = 1.61
@@ -76,6 +79,13 @@ class Config:
     bb_mult: float = 0.35
     threshold: float = 3.0
     source: str = field(default="", repr=False)
+
+    def __post_init__(self) -> None:
+        rsi_period, factor = STRATEGY_DEFAULTS[self.strategy]
+        if self.rsi_period == -1:
+            self.rsi_period = rsi_period
+        if self.factor == -1.0:
+            self.factor = factor
 
     @property
     def bar_hours(self) -> int:
@@ -133,10 +143,12 @@ def _choice(env: dict[str, tuple[str, int]], key: str, default: str, allowed: tu
 
 def load_config(env_path: str = ENV_PATH) -> Config:
     env = read_env_file(env_path)
+    strategy = _choice(env, "STRATEGY", DEFAULT_STRATEGY, STRATEGIES)
+    defaults = Config(strategy=strategy)
     cfg = Config(
         market=(_get(env, "MARKET")[0] or "KRW-BTC").upper(),
         timeframe=_choice(env, "TIMEFRAME", "6h", TIMEFRAMES),
-        strategy=_choice(env, "STRATEGY", "qqe", STRATEGIES),
+        strategy=strategy,
         position_pct=_float(env, "POSITION_PCT", 50.0, 1.0, 100.0),
         max_order_krw=_float(env, "MAX_ORDER_KRW", 0.0, 0.0, 10_000_000_000.0),
         stop_loss_pct=_float(env, "STOP_LOSS_PCT", 5.0, 0.0, 90.0),
@@ -153,9 +165,9 @@ def load_config(env_path: str = ENV_PATH) -> Config:
         fee_rate=_float(env, "FEE_RATE", 0.0005, 0.0, 0.01),
         min_order_krw=_float(env, "MIN_ORDER_KRW", 5000.0, 1000.0, 1_000_000.0),
         slippage_pct=_float(env, "SLIPPAGE_PCT", 0.05, 0.0, 5.0),
-        rsi_period=_int(env, "QQE_RSI_PERIOD", 14, 2, 200),
+        rsi_period=_int(env, "QQE_RSI_PERIOD", defaults.rsi_period, 2, 200),
         sf=_int(env, "QQE_SF", 5, 1, 200),
-        factor=_float(env, "QQE_FACTOR", 4.238, 0.1, 20.0),
+        factor=_float(env, "QQE_FACTOR", defaults.factor, 0.1, 20.0),
         rsi_period2=_int(env, "QQE_RSI_PERIOD2", 6, 2, 200),
         sf2=_int(env, "QQE_SF2", 5, 1, 200),
         factor2=_float(env, "QQE_FACTOR2", 1.61, 0.1, 20.0),
@@ -164,11 +176,6 @@ def load_config(env_path: str = ENV_PATH) -> Config:
         threshold=_float(env, "QQE_THRESHOLD", 3.0, 0.0, 50.0),
         source=env_path if os.path.exists(env_path) else "(no .env; using defaults)",
     )
-    if cfg.strategy == "qqe_mod":
-        if "QQE_RSI_PERIOD" not in env:
-            cfg.rsi_period = MOD_RSI_PERIOD
-        if "QQE_FACTOR" not in env:
-            cfg.factor = MOD_FACTOR
     if not cfg.dry_run and not (cfg.access_key and cfg.secret_key):
         raise ConfigError("[Configuration error] Live mode (DRY_RUN=0) requires API keys.\n"
                           "  Set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY in .env.")

@@ -8,6 +8,7 @@ import sys
 import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -15,9 +16,10 @@ import pandas as pd
 import autotrade_coin
 from autotrade_coin import Bot
 from bot_state import Position, StateStore, StopFlag, now_kst
-from coin_config import Config
+from coin_config import Config, ConfigError
 from coin_kernel import resample_ohlcv
 from fake_exchange import FakeExchange
+from upbit_api import UpbitError
 
 BAR = "2026-08-04T16:00:00+00:00"
 
@@ -28,6 +30,7 @@ def _bot(tmp: str, api: FakeExchange, **cfg_kw) -> Bot:
                          price_guard_pct=5.0, stop_loss_pct=5.0), **cfg_kw)
     bot = Bot(cfg, api)
     bot.store = StateStore(os.path.join(tmp, f"state-{id(api)}.json"))
+    bot.store.state.market = cfg.market
     bot.alert = lambda text: None
     return bot
 
@@ -56,28 +59,105 @@ def test_price_guard_holds_buy(tmp):
     print("  [OK] Price guard defers only excessive gaps")
 
 
-def test_unconfirmed_fill_uses_balance_delta(tmp):
-    autotrade_coin.BALANCE_SETTLE_SEC = 0.0
-    api = FakeExchange(krw=1_000_000.0, fill_state="wait", fill_qty=0.0, fill_avg=0.0)
+def test_uncertain_buy_survives_restart(tmp):
+    api = FakeExchange(krw=1_000_000.0, coin=9.0, fill_qty=1.0, fill_avg=100_000.0)
     bot = _bot(tmp, api)
-    api.fill_qty = 0.0
-    bot.buy(1_000_000.0, 100_000.0, BAR, "entry", 100_000.0)
-    assert not bot.store.state.position.is_open, "Recorded a buy without a balance increase"
+    original = api.buy_market
 
-    moved = FakeExchange(krw=1_000_000.0, fill_state="wait", fill_qty=0.0, fill_avg=0.0)
-    bot2 = _bot(tmp, moved)
-    original = moved.buy_market
+    def accepted_then_timeout(market: str, krw: float, identifier: str) -> str:
+        original(market, krw, identifier)
+        raise UpbitError("Response lost after acceptance")
 
-    def buy_and_settle(market: str, krw: float, identifier: str) -> str:
-        out = original(market, krw, identifier)
-        moved.coin += 4.9
-        return out
+    api.buy_market = accepted_then_timeout
+    try:
+        bot.buy(api.krw, api.price, BAR, "entry")
+    except UpbitError:
+        pass
+    else:
+        raise AssertionError("Expected a lost submission response")
+    assert len(api.orders) == 1 and bot.store.state.pending_order is not None
+    restarted = _bot(tmp, api)
+    restarted.store.load()
+    assert restarted._resolve_order()
+    assert restarted.store.state.pending_order is None
+    assert restarted.store.state.position.qty == 1.0
+    assert len(api.orders) == 1, "Recovery submitted a second order"
+    assert api.coin == 10.0, "Recovery adopted unrelated holdings"
+    print("  [OK] Accepted buy survives response loss and restart without resubmission")
 
-    moved.buy_market = buy_and_settle
-    bot2.buy(1_000_000.0, 100_000.0, BAR, "entry", 100_000.0)
-    pos = bot2.store.state.position
-    assert pos.is_open and abs(pos.qty - 4.9) < 1e-9, f"Failed to recognize the balance increase: {pos.qty}"
-    print("  [OK] Recover unconfirmed fills from balance changes")
+
+def test_unknown_order_blocks_new_orders(tmp):
+    api = FakeExchange(coin=9.0, fill_state="unknown", fill_qty=1.0, fill_avg=100_000.0)
+    bot = _bot(tmp, api)
+    bot.buy(api.krw, api.price, BAR, "entry")
+    assert not bot.store.state.position.is_open
+    bot.buy(api.krw, api.price, "next-bar", "entry")
+    bot.watch_between_bars()
+    assert len(api.orders) == 1 and bot.store.state.pending_order is not None
+    api.fill_state = "done"
+    bot.watch_between_bars()
+    assert bot.store.state.position.qty == 1.0
+    assert bot.store.state.pending_order is None
+    print("  [OK] Unknown order blocks new submissions until identifier reconciliation")
+
+
+def test_partial_order_applied_once(tmp):
+    api = FakeExchange(coin=10.0, fill_state="wait", fill_qty=0.7,
+                       fill_avg=100_000.0, remain_after_sell=9.3)
+    bot = _bot(tmp, api)
+    bot.store.state.position = Position(qty=1.0, entry_price=100_000.0)
+    bot.sell(api.price, BAR, "exit")
+    assert abs(bot.store.state.position.qty - 0.3) < 1e-9
+    restarted = _bot(tmp, api)
+    restarted.store.load()
+    restarted.watch_between_bars()
+    assert len(api.orders) == 1, "Nonterminal partial fill triggered a second sell"
+    assert abs(restarted.store.state.position.qty - 0.3) < 1e-9
+    api.orders[0].executed_qty = 1.0
+    api.coin = 9.0
+    api.fill_state = "done"
+    restarted.watch_between_bars()
+    assert not restarted.store.state.position.is_open
+    assert len(api.orders) == 1 and api.coin == 9.0
+    print("  [OK] Cumulative partial fills apply once across restart")
+
+
+def test_terminal_partial_retry_has_new_identifier(tmp):
+    api = FakeExchange(coin=10.0, fill_state="cancel", fill_avg=100_000.0, remain_after_sell=9.3)
+    bot = _bot(tmp, api)
+    bot.store.state.position = Position(qty=1.0, entry_price=100_000.0)
+    bot.sell(api.price, "w202608050026", "exit")
+    restarted = _bot(tmp, api)
+    restarted.store.load()
+    api.remain_after_sell = 9.0
+    restarted.sell(api.price, "w202608050026", "retry")
+    assert len(api.orders) == 2
+    assert api.orders[0].identifier != api.orders[1].identifier
+    assert not restarted.store.state.position.is_open and api.coin == 9.0
+    print("  [OK] Terminal partial exits use new identifiers even within the same minute")
+
+
+def test_failed_state_save_keeps_order_pending(tmp):
+    api = FakeExchange(coin=10.0, fill_avg=100_000.0)
+    bot = _bot(tmp, api)
+    bot.store.state.position = Position(qty=1.0, entry_price=100_000.0)
+    save = bot.store.save
+    def fail_after_terminal_fill():
+        if bot.store.state.pending_order is None:
+            raise OSError("Disk unavailable")
+        save()
+    bot.store.save = fail_after_terminal_fill
+    try:
+        bot.sell(api.price, BAR, "exit")
+    except OSError:
+        pass
+    else:
+        raise AssertionError("Expected failed state persistence")
+    assert bot.store.state.pending_order is not None
+    bot.store.save = save
+    bot.watch_between_bars()
+    assert len(api.orders) == 1 and not bot.store.state.position.is_open
+    print("  [OK] State-write failure retains order identity until durable reconciliation")
 
 
 def test_dust_is_abandoned(tmp):
@@ -127,7 +207,10 @@ def test_sells_only_bot_quantity(tmp):
     bot.sell(100_000.0, BAR, "exit")
     assert abs(api.orders[0].amount - 1.0) < 1e-8, \
         f"Expected bot-owned quantity 1.0, sold {api.orders[0].amount}; unrelated holdings were sold"
-    print("  [OK] Sell only bot-owned quantity")
+    bot.watch_between_bars()
+    assert len(api.orders) == 1 and api.coin == 9.0
+    assert not bot.store.state.position.is_open and not bot.store.state.pending_exit
+    print("  [OK] Full exits preserve unrelated holdings across subsequent monitoring")
 
 
 def _flat_bars(n: int = 4000) -> pd.DataFrame:
@@ -210,6 +293,83 @@ def test_watch_finishes_pending_exit(tmp):
     print("  [OK] Finish pending exits between bars")
 
 
+def test_monitor_exit_preserves_realized_loss(tmp):
+    api = FakeExchange(krw=0.0, coin=1.0, price=95_000.0, fill_qty=1.0, fill_avg=95_000.0)
+    bot = _bot(tmp, api)
+    bot.store.state.position = Position(qty=1.0, entry_price=100_000.0)
+    bot.store.state.day_start_equity = 100_000.0
+    bot.store.record_account(0.0, 1.0)
+    bot.watch_between_bars()
+    assert api.krw == 95_000.0 and bot.store.state.position.qty == 0.0
+    api.price = 110_000.0
+    flow = bot.store.observe_account(api.krw, bot.store.state.position.qty, api.price)
+    assert flow == 0.0, "Monitoring sale was mistaken for an external cash flow"
+    assert abs(bot.store.day_loss_pct(api.krw) + 5.0) < 1e-9
+    print("  [OK] Monitoring exits preserve realized loss after a price rebound")
+
+
+def test_paper_ledger_is_persistent_and_isolated(tmp):
+    api = FakeExchange(krw=123.0, coin=9.0, price=100_000.0)
+    bot = _bot(tmp, api, dry_run=True, position_pct=100.0)
+    live = Bot(Config(dry_run=False), api)
+    paper = Bot(Config(dry_run=True), api)
+    assert live.store.path != paper.store.path and live.stop.path != paper.stop.path
+    assert live.lock.path == paper.lock.path
+    assert bot.read_account() == (10_000_000.0, 0.0)
+    bot.buy(bot.read_account()[0], api.price, BAR, "paper entry")
+    cash, qty = bot.read_account()
+    assert cash >= 0 and qty > 0 and cash < 2.0
+    assert abs(cash + qty * 100_000.0 - 10_000_000.0 / 1.0005) < 2.0
+    restarted = _bot(tmp, api, dry_run=True)
+    restarted.store.load()
+    assert restarted.read_account() == (cash, qty)
+    restarted.sell(110_000.0, "later", "paper exit")
+    assert restarted.read_account()[0] > 10_000_000.0
+    assert restarted.read_account()[1] == 0.0
+    assert not api.orders and api.krw == 123.0 and api.coin == 9.0
+    print("  [OK] Paper ledger persists cash and positions without using live balances")
+
+
+def test_live_cooldown_matches_execution_bar(tmp):
+    bot = _bot(tmp, FakeExchange(), timeframe="6h", cooldown_bars=1)
+    bot.store.state.last_exit_time = "2026-08-04T16:05:00+00:00"
+    with patch.object(autotrade_coin, "decide_last_bar", return_value=("BUY", "entry")):
+        for hour in (12, 18):
+            bars = pd.DataFrame(index=pd.DatetimeIndex([f"2026-08-04T{hour}:00:00+00:00"]))
+            assert bot._decide(bars)[0] is None
+        bars = pd.DataFrame(index=pd.DatetimeIndex(["2026-08-05T00:00:00+00:00"]))
+        assert bot._decide(bars)[0] == "BUY"
+        bot.cfg = replace(bot.cfg, cooldown_bars=0)
+        bars = pd.DataFrame(index=pd.DatetimeIndex(["2026-08-04T12:00:00+00:00"]))
+        assert bot._decide(bars)[0] == "BUY"
+    print("  [OK] Live cooldown uses the exit execution bar and zero disables it")
+
+
+def test_market_binding_rejects_switch_and_legacy_position(tmp):
+    api = FakeExchange(coin=10.0, fill_avg=100_000.0)
+    bot = _bot(tmp, api)
+    bot.store.state.position = Position(qty=1.0, entry_price=100_000.0)
+    bot.cfg = replace(bot.cfg, market="KRW-ETH")
+    with patch.object(api, "balances", side_effect=AssertionError("Read wrong-market balances")):
+        for market in ("KRW-BTC", ""):
+            bot.store.state.market = market
+            try:
+                bot.sell(api.price, BAR, "exit")
+            except ConfigError:
+                pass
+            else:
+                raise AssertionError("Market change or unbound legacy position was accepted")
+    assert api.orders == [] and api.coin == 10.0
+    bot.store.state.market = "KRW-BTC"
+    bot.store.save()
+    restarted = _bot(tmp, api)
+    restarted.store.load()
+    assert restarted.store.state.market == "KRW-BTC"
+    restarted.sell(api.price, BAR, "verified exit")
+    assert api.coin == 9.0
+    print("  [OK] Market binding rejects mismatched and unbound positions before exchange I/O")
+
+
 def test_watch_identifier_differs_per_minute(tmp):
     bot = _bot(tmp, FakeExchange(), stop_loss_pct=5.0)
     a = bot._identifier("w202608050026", "ask")
@@ -246,7 +406,11 @@ def main() -> int:
     try:
         test_position_pct_and_cap(tmp)
         test_price_guard_holds_buy(tmp)
-        test_unconfirmed_fill_uses_balance_delta(tmp)
+        test_uncertain_buy_survives_restart(tmp)
+        test_unknown_order_blocks_new_orders(tmp)
+        test_partial_order_applied_once(tmp)
+        test_terminal_partial_retry_has_new_identifier(tmp)
+        test_failed_state_save_keeps_order_pending(tmp)
         test_dust_is_abandoned(tmp)
         test_exchange_rejection_stops_retrying(tmp)
         test_partial_fill_keeps_pending_exit(tmp)
@@ -255,6 +419,10 @@ def main() -> int:
         test_daily_loss_halts_bot(tmp)
         test_watch_stops_out_between_bars(tmp)
         test_watch_finishes_pending_exit(tmp)
+        test_monitor_exit_preserves_realized_loss(tmp)
+        test_paper_ledger_is_persistent_and_isolated(tmp)
+        test_live_cooldown_matches_execution_bar(tmp)
+        test_market_binding_rejects_switch_and_legacy_position(tmp)
         test_watch_identifier_differs_per_minute(tmp)
         test_order_log_is_readable_in_excel(tmp)
         print("\nAll checks passed")

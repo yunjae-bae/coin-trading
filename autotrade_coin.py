@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import sys
 import time
@@ -13,6 +14,8 @@ import notify
 from bot_state import (
     CASHFLOW_TRACKING_VERSION,
     KST,
+    PendingOrder,
+    Position,
     RunLock,
     StateStore,
     StopFlag,
@@ -30,16 +33,16 @@ from coin_kernel import (
 from upbit_api import Exchange, Upbit, UpbitError
 
 OUT_DIR = os.path.join(BASE_DIR, "out")
-LOG_PATH = os.path.join(OUT_DIR, "\uae30\ub85d.log")
-ORDERS_PATH = os.path.join(OUT_DIR, "\uc8fc\ubb38\ub0b4\uc5ed.csv")
+LOG_PATH = os.path.join(OUT_DIR, "trading.log")
+ORDERS_PATH = os.path.join(OUT_DIR, "orders.csv")
 STATUS_PATH = os.path.join(OUT_DIR, "status.txt")
 STATE_PATH = os.path.join(OUT_DIR, "state.json")
+# Retain legacy stop and lock paths so upgrades cannot bypass an active halt or instance.
 STOP_PATH = os.path.join(OUT_DIR, "\ubd07\uc815\uc9c0.txt")
 LOCK_PATH = os.path.join(OUT_DIR, "\uc2e4\ud589\uc911.lock")
 
 ORDER_HEADER = ["timestamp", "side", "reason", "market", "quantity", "fill_price", "amount", "mode", "order_id"]
 LOG_MAX_BYTES = 5 * 1024 * 1024
-BALANCE_SETTLE_SEC = 2.0
 
 
 def _rotate_log() -> None:
@@ -77,8 +80,9 @@ class Bot:
     def __init__(self, cfg: Config, api: Exchange | None = None):
         self.cfg = cfg
         self.api: Exchange = api or Upbit(cfg.access_key, cfg.secret_key)
-        self.store = StateStore(STATE_PATH)
-        self.stop = StopFlag(STOP_PATH)
+        runtime = os.path.join(OUT_DIR, "paper") if cfg.dry_run else OUT_DIR
+        self.store = StateStore(os.path.join(runtime, os.path.basename(STATE_PATH)))
+        self.stop = StopFlag(os.path.join(runtime, os.path.basename(STOP_PATH)))
         self.lock = RunLock(LOCK_PATH)
         self.last_error = ""
         self.last_decision = "-"
@@ -93,6 +97,21 @@ class Bot:
             log(f"  (Notification delivery failed: {type(e).__name__})")
 
 
+    def _ensure_market(self) -> None:
+        st = self.store.state
+        recorded = st.market or (st.pending_order.market if st.pending_order else "")
+        if st.position.is_open and not recorded:
+            raise ConfigError("Legacy position has no market. Verify its ownership and set the state market before resuming.")
+        if recorded and recorded != self.cfg.market and (st.position.is_open or st.pending_order):
+            raise ConfigError(f"Tracked position or order belongs to {recorded}; restore MARKET before resuming.")
+        if st.market != self.cfg.market:
+            st.market = self.cfg.market
+            st.day_date = ""
+            st.account_observed = False
+            st.last_exit_time = ""
+            st.last_bar_attempted = ""
+            self.store.save()
+
     def fetch_bars(self) -> pd.DataFrame:
         need_1h = (warmup_bars(self.cfg) + 5) * self.cfg.bar_hours
         df_1h = self.api.candles_1h(self.cfg.market, need_1h)
@@ -104,9 +123,9 @@ class Bot:
         return bars
 
     def read_account(self) -> tuple[float, float]:
-        if self.cfg.dry_run and not (self.cfg.access_key and self.cfg.secret_key):
-            pos = self.store.state.position
-            return 10_000_000.0, pos.qty
+        self._ensure_market()
+        if self.cfg.dry_run:
+            return self.store.state.paper_krw, self.store.state.position.qty
         return self.api.balances(self.cfg.market)
 
 
@@ -115,6 +134,10 @@ class Bot:
 
     def buy(self, krw: float, price: float | None, bar_iso: str, reason: str,
             bar_close: float = 0.0) -> None:
+        self._ensure_market()
+        if self.store.state.pending_order is not None:
+            self._resolve_order()
+            return
         budget = krw * self.cfg.position_pct / 100.0
         if self.cfg.max_order_krw > 0:
             budget = min(budget, self.cfg.max_order_krw)
@@ -134,8 +157,15 @@ class Bot:
         if self.cfg.dry_run:
             log(f"  [dry run] buy {order_krw:,.0f} KRW (approximate price {price:,.0f} KRW)" if price
                 else f"  [dry run] buy {order_krw:,.0f} KRW")
-            qty = order_krw / price if price else 0.0
-            self.store.open_position(qty, price or 0.0)
+            if not price or price <= 0:
+                return
+            qty = order_krw / price
+            st = self.store.state
+            st.paper_krw -= order_krw * (1 + self.cfg.fee_rate)
+            st.position = Position(qty, price, fmt(now_kst()))
+            st.pending_exit = False
+            st.last_trade_time = fmt(now_kst())
+            self.store.record_account(self.store.state.paper_krw, qty)
             self.alert(f"🟢 buy\n{self.cfg.market} {order_krw:,.0f} KRW\n"
                        f"Price {price:,.0f} KRW\nReason: {reason}" if price else
                        f"🟢 buy\n{self.cfg.market} {order_krw:,.0f} KRW\nReason: {reason}")
@@ -144,35 +174,89 @@ class Bot:
                        "amount": f"{order_krw:.0f}", "mode": "dry run", "order_id": ident})
             return
 
-        qty_before = self.api.balances(self.cfg.market)[1]
-        order_no = self.api.buy_market(self.cfg.market, order_krw, ident)
-        state, exec_qty, avg = self.api.wait_done(ident)
-        if exec_qty <= 0:
-            time.sleep(BALANCE_SETTLE_SEC)
-            exec_qty = max(0.0, self.api.balances(self.cfg.market)[1] - qty_before)
-            avg = price or 0.0
-        if exec_qty > 0:
-            self.store.open_position(exec_qty, avg or price or 0.0)
-            log(f"  Buy filled {exec_qty:.8f} {self.cfg.market.split('-')[1]} "
-                f"@ {avg:,.0f} KRW (status {state})")
-            sl = (avg or price or 0.0) * (1 - self.cfg.stop_loss_pct / 100)
-            self.alert(f"🟢 Buy filled\n{self.cfg.market} {exec_qty:.8f}\n"
-                       f"Fill price {avg:,.0f} KRW ({order_krw:,.0f} KRW total)\n"
-                       + (f"Stop level {sl:,.0f} KRW\n" if self.cfg.stop_loss_pct > 0 else "")
-                       + f"Reason: {reason}")
+        self._submit_order(ident, "bid", order_krw, reason)
+
+    def _submit_order(self, identifier: str, side: str, amount: float, reason: str) -> None:
+        st = self.store.state
+        st.order_sequence += 1
+        identifier = f"{identifier}-{st.order_sequence}"
+        st.pending_order = PendingOrder(identifier, side, self.cfg.market, st.position.qty, reason)
+        self.store.save()  # Persist intent before an exchange can accept the order.
+        try:
+            if side == "bid":
+                self.api.buy_market(self.cfg.market, amount, identifier)
+            else:
+                self.api.sell_market(self.cfg.market, amount, identifier)
+        except UpbitError as exc:
+            # Definitive rejections have no fills; uncertain responses retain their identifier.
+            if exc.code in ("under_min_total_bid", "under_min_total_ask",
+                            "insufficient_funds_bid", "insufficient_funds_ask"):
+                st.pending_order = None
+                self.store.save()
+                if side == "ask" and exc.code == "under_min_total_ask":
+                    self.store.close_position()
+                    return
+            raise
+        self._resolve_order()
+
+    def _resolve_order(self) -> bool:
+        self._ensure_market()
+        st = self.store.state
+        pending = st.pending_order
+        if pending is None:
+            return True
+        if pending.market != self.cfg.market:
+            raise ConfigError("Resolve the pending order before changing MARKET.")
+        state, filled, average = self.api.wait_done(pending.identifier)
+        if state not in ("wait", "watch", "done", "cancel"):
+            log(f"Order {pending.identifier} remains unresolved.")
+            return False
+        if (not math.isfinite(filled) or not math.isfinite(average)
+                or filled < pending.filled_qty or (filled > 0 and average <= 0)):
+            raise UpbitError("Order fill data is incomplete; retaining the pending order.")
+        cash, _ = self.api.balances(pending.market)
+        self._apply_order_fill(pending, filled, average, cash)
+        terminal = state in ("done", "cancel")
+        if terminal:
+            st.pending_order = None
+        try:
+            self.store.save()
+        except OSError:
+            st.pending_order = pending
+            raise
+        if terminal:
+            log_order({"timestamp": fmt(now_kst()), "side": "buy" if pending.side == "bid" else "sell",
+                       "reason": pending.reason, "market": pending.market,
+                       "quantity": f"{filled:.8f}", "fill_price": f"{average:.0f}" if filled else "",
+                       "amount": f"{filled * average:.0f}", "mode": "live",
+                       "order_id": pending.identifier})
+            self.alert(f"Order {pending.identifier}: {state}; filled {filled:.8f} at {average:,.0f} KRW")
+        return terminal
+
+    def _apply_order_fill(self, pending: PendingOrder, filled: float, average: float, cash: float) -> None:
+        st = self.store.state
+        if pending.side == "bid":
+            if filled > 0:
+                st.position = Position(pending.position_qty + filled, average, fmt(now_kst()))
         else:
-            log(f"  ⚠ Buy submitted but fill unconfirmed (status {state}). "
-                f"The balance will be checked again next cycle.")
-            self.alert(f"⚠️ Buy submitted but fill unconfirmed\n"
-                       f"{self.cfg.market} {order_krw:,.0f} KRW (status {state})\n"
-                       f"Check the order history in the Upbit app.")
-        log_order({"timestamp": fmt(now_kst()), "side": "buy", "reason": reason, "market": self.cfg.market,
-                   "quantity": f"{exec_qty:.8f}", "fill_price": f"{avg:.0f}" if avg else "",
-                   "amount": f"{order_krw:.0f}",
-                   "mode": "live" if exec_qty > 0 else "live (unconfirmed)",
-                   "order_id": order_no or ident})
+            st.position.qty = max(0.0, pending.position_qty - filled)
+            if st.position.qty < 1e-8:
+                st.position = Position()
+            st.pending_exit = st.position.is_open
+            if filled > pending.filled_qty:
+                st.last_exit_time = self.api.now_utc().isoformat()
+        if filled > 0:
+            st.last_trade_time = fmt(now_kst())
+        st.account_observed = True
+        st.observed_krw = cash
+        st.observed_position_qty = st.position.qty
+        pending.filled_qty = filled
 
     def sell(self, price: float | None, bar_iso: str, reason: str) -> None:
+        self._ensure_market()
+        if self.store.state.pending_order is not None:
+            self._resolve_order()
+            return
         pos = self.store.state.position
         qty = int(pos.qty * 1e8) / 1e8          # Truncate to eight decimals; rounding up could exceed the balance.
         if qty <= 0:
@@ -181,7 +265,7 @@ class Bot:
             return
         # Unsellable dust would otherwise trigger retries on every bar.
         if price and qty * price < self.cfg.min_order_krw:
-            log(f"  ⚠ Remaining quantity {qty:.8f} is valued at {qty * price:,.0f} KRW, below the minimum order amount"
+            log(f"  ⚠ Remaining quantity {qty:.8f} is valued at {qty * price:,.0f} KRW, below the minimum order amount "
                 f"({self.cfg.min_order_krw:,.0f} KRW); unable to sell.\n"
                 f"     → The bot abandons this dust position and waits for the next signal. "
                 f"You can manage it directly in the Upbit app.")
@@ -191,8 +275,16 @@ class Bot:
         if self.cfg.dry_run:
             log(f"  [dry run] sell {qty:.8f} (approximate price {price:,.0f} KRW)" if price
                 else f"  [dry run] sell {qty:.8f}")
-            pnl = ((price / pos.entry_price - 1) * 100) if (price and pos.entry_price) else None
-            self.store.close_position()
+            if not price or price <= 0:
+                return
+            pnl = ((price / pos.entry_price - 1) * 100) if pos.entry_price else None
+            st = self.store.state
+            st.paper_krw += qty * price * (1 - self.cfg.fee_rate)
+            st.position = Position()
+            st.pending_exit = False
+            st.last_trade_time = fmt(now_kst())
+            st.last_exit_time = self.api.now_utc().isoformat()
+            self.store.record_account(self.store.state.paper_krw, 0.0)
             self.alert(f"🔴 sell\n{self.cfg.market} {qty:.8f}\n"
                        + (f"Price {price:,.0f} KRW ({pnl:+.2f}%)\n" if pnl is not None else "")
                        + f"Reason: {reason}")
@@ -201,38 +293,7 @@ class Bot:
                        "amount": f"{qty * (price or 0):.0f}", "mode": "dry run", "order_id": ident})
             return
 
-        try:
-            order_no = self.api.sell_market(self.cfg.market, qty, ident)
-        except UpbitError as e:
-            if e.code in ("under_min_total_ask", "insufficient_funds_ask"):
-                log(f"  ⚠ Upbit rejected the sell order: {e}\n"
-                    f"     → Remaining quantity({qty:.8f}) is too small to sell. "
-                    f"The bot abandons this dust position and waits for the next signal.")
-                self.store.close_position()
-                return
-            raise
-        state, exec_qty, avg = self.api.wait_done(ident)
-        remain = self.api.balances(self.cfg.market)[1]
-        if remain < pos.qty * 0.001:
-            entry = pos.entry_price
-            self.store.close_position()
-            log(f"  Sell filled {exec_qty or qty:.8f} @ {avg:,.0f} KRW (status {state})")
-            pnl = ((avg / entry - 1) * 100) if (avg and entry) else None
-            self.alert(f"🔴 Sell filled\n{self.cfg.market} {exec_qty or qty:.8f}\n"
-                       f"Fill price {avg:,.0f} KRW"
-                       + (f" ({pnl:+.2f}%)\n" if pnl is not None else "\n")
-                       + f"Reason: {reason}")
-        else:
-            self.store.mark_pending_exit(min(pos.qty, remain))
-            log(f"  ⚠ Sell partially filled (Remaining quantity {remain:.8f}). "
-                f"The remaining position will be closed regardless of the next signal.")
-            self.alert(f"⚠️ Sell partially filled\n{self.cfg.market}\n"
-                       f"Sold quantity {exec_qty or 0:.8f} / Remaining quantity {remain:.8f}\n"
-                       f"Retrying the remainder in one minute.")
-        log_order({"timestamp": fmt(now_kst()), "side": "sell", "reason": reason, "market": self.cfg.market,
-                   "quantity": f"{exec_qty or qty:.8f}", "fill_price": f"{avg:.0f}" if avg else "",
-                   "amount": f"{(exec_qty or qty) * (avg or price or 0):.0f}", "mode": "live",
-                   "order_id": order_no or ident})
+        self._submit_order(ident, "ask", qty, reason)
 
 
     def _notify_orphan(self, price: float | None, coin_qty: float) -> None:
@@ -285,9 +346,16 @@ class Bot:
         st = self.store.state
         if st.pending_exit and st.position.is_open:
             return "SELL", "Close remaining position"
-        return decide_last_bar(bars, self.cfg, st.position.is_open, st.position.entry_price)
+        action, reason = decide_last_bar(bars, self.cfg, st.position.is_open, st.position.entry_price)
+        if action == "BUY" and st.last_exit_time and self.cfg.cooldown_bars > 0:
+            exit_bar = pd.Timestamp(st.last_exit_time).tz_convert("UTC").floor(f"{self.cfg.bar_hours}h")
+            if bars.index[-1] <= exit_bar + timedelta(hours=self.cfg.bar_hours * self.cfg.cooldown_bars):
+                return None, "Entry cooldown"
+        return action, reason
 
     def cycle(self) -> None:
+        if not self._resolve_order():
+            return
         cfg = self.cfg
         bars = self.fetch_bars()
         price = self.api.last_price(cfg.market)
@@ -311,7 +379,7 @@ class Bot:
             krw, pos.qty, mark, adjust_day_base=not new_day)
         if external_flow:
             direction = "deposit" if external_flow > 0 else "withdrawal"
-            log(f"  External cash flow: {direction}of approximately {abs(external_flow):,.0f} KRW detected; "
+            log(f"  External cash flow: {direction} of approximately {abs(external_flow):,.0f} KRW detected; "
                 f"excluded from daily profit/loss")
         self._halt_on_daily_loss(equity, mark, krw)
 
@@ -328,7 +396,7 @@ class Bot:
             self.last_decision = f"{reason} — Buy deferred"
 
         held = f"holding {pos.qty:.8f} (Entry price {pos.entry_price:,.0f} KRW)" if pos.is_open else "No position"
-        log(f"   bars {fmt(bars.index[-1].to_pydatetime())} Close {close:,.0f} KRW | {held} | "
+        log(f"  Bar {fmt(bars.index[-1].to_pydatetime())} Close {close:,.0f} KRW | {held} | "
             f"KRW balance {krw:,.0f} KRW → {action or 'wait'} ({reason})")
         if not action:
             return
@@ -337,7 +405,7 @@ class Bot:
         # must not create another buy for the same bar.
         bar_iso = bars.index[-1].isoformat()
         if self.store.state.last_bar_attempted == bar_iso:
-            log(f"  Skipping: bar({bar_iso}) was already processed")
+            log(f"  Skipping: bar ({bar_iso}) was already processed")
             return
         self.store.state.last_bar_attempted = bar_iso
         self.store.save()
@@ -350,6 +418,8 @@ class Bot:
 
 
     def watch_between_bars(self) -> None:
+        if not self._resolve_order():
+            return
         st = self.store.state
         pos = st.position
         if not pos.is_open:
@@ -460,39 +530,19 @@ class Bot:
         if self.stop.active:
             print(f"\n{'=' * 50}\nThe bot is stopped.\n\n{self.stop.reason()}\n{'=' * 50}")
             return True
-        if self.lock.held_by_other():
-            print(f"\n{'=' * 50}\nAnother bot instance is already running.\n"
-                  f"Running two instances may corrupt shared state.\n\n"
-                  f"Close this window and keep the existing instance running.\n"
-                  f"(If the other instance has stopped, wait two minutes before restarting)\n{'=' * 50}")
-            return True
         return False
 
-    def _upgrade_cashflow_tracking(self) -> bool:
+    def _upgrade_cashflow_tracking(self) -> None:
         st = self.store.state
         if st.cashflow_tracking_version >= CASHFLOW_TRACKING_VERSION:
-            return False
-
-        recovered = False
-        if self.stop.active:
-            reason = self.stop.reason()
-            is_daily_loss_stop = (
-                ("\ud55c\ub3c4" in reason and ("\uc624\ub298 \uc190\uc2e4" in reason or "\uc77c\uc77c \uc190\uc2e4" in reason)) or ("daily loss" in reason.lower() and "limit" in reason.lower())
-            )
-            if is_daily_loss_stop:
-                self.stop.clear()
-                st.day_date = ""
-                st.day_start_equity = 0.0
-                recovered = True
+            return
         st.cashflow_tracking_version = CASHFLOW_TRACKING_VERSION
         st.account_observed = False
         st.observed_krw = 0.0
         st.observed_position_qty = 0.0
         self.store.save()
-        if recovered:
-            log("  Cleared a legacy stop caused by treating a withdrawal as a loss. "
-                "Using current balances as the new reference")
-        return recovered
+        if self.stop.active:
+            log("Legacy halt retained.")
 
     def _greet(self) -> None:
         log(f"■ Start\n{describe(self.cfg)}")
@@ -518,6 +568,8 @@ class Bot:
         """Return price and KRW, or (None, None) on failure. Exit on configuration errors."""
         try:
             self.cycle()
+            if self.store.state.pending_order is not None:
+                return None, None
             self.last_error = ""
             self.fail_streak = 0
             price = self.api.last_price(self.cfg.market)
@@ -559,7 +611,6 @@ class Bot:
         """Return False when a stop flag requests shutdown."""
         last_watch = 0.0
         while now_kst() < until:
-            self.lock.touch()
             if self.stop.active:
                 log("■ Stop file detected; exiting")
                 return False
@@ -570,18 +621,20 @@ class Bot:
         return True
 
     def run(self, once: bool = False) -> None:
+        if not self.lock.acquire():
+            log("Another bot instance holds the runtime lock; exiting.")
+            return
         warn = self.store.load()
         if warn:
             log(f"⚠ {warn}")
+        self._ensure_market()
         self._upgrade_cashflow_tracking()
         if self._blocked():
             return
-        self.lock.touch()
         self._greet()
 
         while True:
             price, krw = self._step()
-            self.lock.touch()
             self.next_wake = self.next_bar_close()
             self.write_status(price, krw)
             self.maybe_heartbeat(price, krw)
@@ -604,6 +657,9 @@ def main() -> None:
     bot = Bot(cfg)
     try:
         bot.run(once=once)
+    except ConfigError as e:
+        print(f"\n{e}\n")
+        raise SystemExit(2) from e
     finally:
         bot.lock.release()
 

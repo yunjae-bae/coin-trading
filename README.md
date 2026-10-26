@@ -10,9 +10,9 @@ cp .env.example .env
 uv run python autotrade_coin.py
 ```
 
-On PowerShell, use `Copy-Item .env.example .env`. Configure `.env` for your market and position size. `DRY_RUN=1` skips real orders; `DRY_RUN=0` submits real orders and requires Upbit API keys. Telegram settings are optional.
+On PowerShell, use `Copy-Item .env.example .env`. Configure `.env` for your market and position size. `DRY_RUN=1` uses a separate paper balance; `DRY_RUN=0` submits real orders and requires Upbit API keys. Telegram settings are optional.
 
-State and logs are written to `out/`. Stop older instances before upgrading; review a halt before removing its stop file.
+State and logs are written to `out/`; paper state is in `out/paper/`. Stop older instances before upgrading. For a halt or unresolved order, check exchange records before editing state or removing a stop file. Positions and pending orders must stay with their recorded market.
 
 ### Backtests
 

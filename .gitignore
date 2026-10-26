@@ -13,7 +13,7 @@ coin_backtest_output/
 out/
 .DS_Store
 
-# Generated mutation-testing source copies.
+# Generated mutation-testing copies
 mutants/
 .mutmut-cache
 

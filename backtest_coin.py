@@ -8,8 +8,6 @@ import pandas as pd
 
 from coin_config import (
     BASE_DIR,
-    MOD_FACTOR,
-    MOD_RSI_PERIOD,
     Config,
     describe,
     load_config,
@@ -69,7 +67,10 @@ class _Book:
 
     def buy(self, px: float, cfg: Config) -> tuple[float, float] | None:
         """Return quantity and fee, or None below the minimum order."""
-        order_krw = (self.krw * cfg.position_pct / 100.0) / (1.0 + cfg.fee_rate)
+        budget = self.krw * cfg.position_pct / 100.0
+        if cfg.max_order_krw > 0:
+            budget = min(budget, cfg.max_order_krw)
+        order_krw = budget / (1.0 + cfg.fee_rate)
         if order_krw < cfg.min_order_krw:
             return None
         fee = order_krw * cfg.fee_rate
@@ -112,33 +113,54 @@ def _decide(holding: bool, entry: bool, exit_: bool, bars_since_exit: int,
     """Return an empty string when no order is due."""
     if holding:
         return "SELL" if exit_ else ""
-    if entry and bars_since_exit > cooldown_bars:
+    if entry and (cooldown_bars == 0 or bars_since_exit > cooldown_bars):
         return "BUY"
     return ""
 
 
-def simulate(bars: pd.DataFrame, sig: pd.DataFrame, cfg: Config, init_cash: float) -> Result:
+def _evaluation_start(index: pd.Index, cfg: Config, start: pd.Timestamp | None) -> int:
+    n = len(index)
+    if not n:
+        raise ValueError("Empty signals; no bars to simulate")
+    warm = min(warmup_bars(cfg), max(0, n - 2))
+    if start is not None:
+        warm = max(warm, int(index.searchsorted(start)))
+    if warm >= n:
+        raise ValueError("No bars within the evaluation period")
+    return warm
+
+
+def simulate(bars: pd.DataFrame, sig: pd.DataFrame, cfg: Config, init_cash: float,
+             *, start: pd.Timestamp | None = None) -> Result:
     """Fill close signals at the next open; retain earlier history for warmup."""
     if not sig.index.equals(bars.index):
         raise ValueError("bars and sig indexes differ; prices and signals must align")
     n = len(sig.index)
-    if n == 0:
-        raise ValueError("Empty signals; no bars to simulate")
-
+    warm = _evaluation_start(sig.index, cfg, start)
     opens = bars["open"].to_numpy(dtype=float)
     lows = bars["low"].to_numpy(dtype=float)
     closes = sig["close"].to_numpy(dtype=float)
     entries = sig["entry"].to_numpy(dtype=bool)
     exits = sig["exit"].to_numpy(dtype=bool)
     idx = sig.index
-    warm = min(warmup_bars(cfg), max(0, n - 2))
 
     book = _Book(krw=float(init_cash))
     trades: list[Trade] = []
     curve: list[float] = []
     last_exit_i = -(10 ** 9)
+    pending = ""
 
     for i in range(warm, n):
+        if pending:
+            px = _fill_price(opens[i], cfg, is_buy=pending == "BUY")
+            if pending == "BUY":
+                filled = book.buy(px, cfg)
+                if filled:
+                    trades.append(Trade(idx[i], "BUY", REASON_BUY, px, *filled, book.krw))
+            else:
+                sold, fee = book.sell(px, cfg, is_stop=False)
+                trades.append(Trade(idx[i], "SELL", REASON_EXIT, px, sold, fee, book.krw))
+                last_exit_i = i
         if book.qty > 0 and cfg.stop_loss_pct > 0:
             fill = _stop_fill(book.entry_price, lows[i], opens[i], cfg)
             if fill is not None:
@@ -146,19 +168,9 @@ def simulate(bars: pd.DataFrame, sig: pd.DataFrame, cfg: Config, init_cash: floa
                 trades.append(Trade(idx[i], "SELL", REASON_STOP, fill, sold, fee, book.krw))
                 last_exit_i = i
 
-        action = _decide(book.qty > 0, bool(entries[i]), bool(exits[i]),
-                         i - last_exit_i, cfg.cooldown_bars)
-        if action and i + 1 < n:
-            px = _fill_price(opens[i + 1], cfg, is_buy=action == "BUY")
-            if action == "BUY":
-                filled = book.buy(px, cfg)
-                if filled:
-                    trades.append(Trade(idx[i + 1], "BUY", REASON_BUY, px, *filled, book.krw))
-            else:
-                sold, fee = book.sell(px, cfg, is_stop=False)
-                trades.append(Trade(idx[i + 1], "SELL", REASON_EXIT, px, sold, fee, book.krw))
-                last_exit_i = i
         curve.append(book.krw + book.qty * closes[i])
+        pending = _decide(book.qty > 0, bool(entries[i]), bool(exits[i]),
+                          i - last_exit_i, cfg.cooldown_bars)
 
     eq = pd.DataFrame({"ts": idx[warm:n], "equity_krw": curve})
     final = float(eq["equity_krw"].iloc[-1])
@@ -191,21 +203,28 @@ def load_bars(path: str) -> pd.DataFrame:
 
 def compare(df_1h: pd.DataFrame, init_cash: float) -> None:
     combos: list[tuple[str, str, float, Result]] = []
+    inputs: list[tuple[Config, pd.DataFrame, pd.DataFrame]] = []
     for strat in ("qqe", "qqe_mod"):
         for tf in ("1h", "4h", "6h"):
             base = Config(strategy=strat, timeframe=tf, position_pct=100.0)
-            if strat == "qqe_mod":
-                base = replace(base, rsi_period=MOD_RSI_PERIOD, factor=MOD_FACTOR)
             bars = resample_ohlcv(df_1h, tf)
+            if len(bars) <= warmup_bars(base):
+                raise ValueError(f"Insufficient history for a common comparison period ({strat}/{tf})")
             sig = compute_signals(bars, base)
-            for sl in (0.0, 3.0, 5.0, 10.0):
-                r = simulate(bars, sig, replace(base, stop_loss_pct=sl), init_cash)
-                combos.append((strat, tf, sl, r))
+            inputs.append((base, bars, sig))
+    start = max(bars.index[warmup_bars(cfg)] for cfg, bars, _ in inputs)
+    end = min(bars.index[-1] + pd.Timedelta(hours=cfg.bar_hours) for cfg, bars, _ in inputs)
+    for base, bars, sig in inputs:
+        complete = bars.index + pd.Timedelta(hours=base.bar_hours) <= end
+        for sl in (0.0, 3.0, 5.0, 10.0):
+            r = simulate(bars.loc[complete], sig.loc[complete], replace(base, stop_loss_pct=sl),
+                         init_cash, start=start)
+            combos.append((base.strategy, base.timeframe, sl, r))
 
     r0 = combos[0][3]
     print(f"\n=== KRW-BTC QQE Backtest comparison (Initial {init_cash:,.0f} KRW, Allocation 100%, "
           f"Fees 0.05%, Slippage {r0.slippage_pct:g}%) ===")
-    print(f"Period: {r0.start} ~ {r0.end}   |   Buy and hold(B&H) {r0.bh_pct:+.2f}%\n")
+    print(f"Period: {start} ~ {end} (end exclusive)\n")
     print(f"{'strategy':<9}{'TF':<5}{'Stop':>6}{'return':>11}{'MDD':>10}{'Trades':>7}{'Win %':>8}{'stops':>7}{'Fees':>13}")
     print("-" * 80)
     for strat, tf, sl, r in combos:
